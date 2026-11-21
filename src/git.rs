@@ -1,10 +1,8 @@
 use std::cell::RefCell;
 use std::collections::VecDeque;
-use std::io::Write;
 use std::sync::Arc;
 
-use flate2::write::ZlibEncoder;
-use flate2::{Compression, Decompress, FlushDecompress, Status};
+use flate2::{Compress, Compression, Decompress, FlushCompress, FlushDecompress, Status};
 use rustc_hash::FxHashMap;
 use sha1::{Digest, Sha1};
 
@@ -29,11 +27,23 @@ struct PackScratch {
     buf: Vec<u8>,
 }
 
+struct DeflateScratch {
+    comp_fast: Compress,
+    comp_best: Compress,
+    tmp: Vec<u8>,
+}
+
 thread_local! {
     static INFLATE_SCRATCH: RefCell<PackScratch> = RefCell::new(PackScratch {
         decomp: Decompress::new(true),
         buf: vec![0u8; 65536],
     });
+    static DEFLATE_SCRATCH: RefCell<DeflateScratch> = RefCell::new(DeflateScratch {
+        comp_fast: Compress::new(Compression::fast(), true),
+        comp_best: Compress::new(Compression::best(), true),
+        tmp: vec![0u8; 16384],
+    });
+    static REPORT_SCRATCH: RefCell<Vec<u8>> = RefCell::new(Vec::with_capacity(256));
 }
 
 pub fn handle_git(
@@ -522,7 +532,7 @@ fn build_ls_refs_body(
 
 fn build_depth1_cached_fetch(repo: &Repo, tip: Oid) -> Arc<[u8]> {
     let (to_send, new_shallow, _) = compute_fetch_objects(repo, &[tip], &[], &[], Some(1));
-    let pack = build_pack(repo, &to_send, Compression::best());
+    let pack = build_pack(repo, &to_send, true);
     let mut body = Vec::with_capacity(128 + pack.len());
     if !new_shallow.is_empty() {
         write_pkt_line(&mut body, b"shallow-info\n");
@@ -592,7 +602,7 @@ fn build_v2_fetch_body(
         out.extend_from_slice(b"0001");
     }
 
-    let pack = build_pack(repo, &to_send, Compression::fast());
+    let pack = build_pack(repo, &to_send, false);
     write_pkt_line(&mut out, b"packfile\n");
     write_sideband_pack(&mut out, &pack);
     out.extend_from_slice(b"0000");
@@ -667,7 +677,7 @@ fn handle_upload_pack_v0(
             out.extend_from_slice(b"0000");
         }
         write_pkt_line(&mut out, b"NAK\n");
-        let pack = build_pack(&repo, &to_send, Compression::fast());
+        let pack = build_pack(&repo, &to_send, false);
         write_sideband_pack(&mut out, &pack);
         out.extend_from_slice(b"0000");
         out
@@ -844,31 +854,66 @@ fn compute_fetch_objects(
     (to_send, new_shallow, unshallow)
 }
 
-fn build_pack(repo: &Repo, oids: &[Oid], level: Compression) -> Vec<u8> {
+fn compress_zlib_into(comp: &mut Compress, tmp: &mut Vec<u8>, input: &[u8], out: &mut Vec<u8>) {
+    comp.reset();
+    let mut in_off = 0usize;
+    loop {
+        let before_in = comp.total_in() as usize;
+        let before_out = comp.total_out() as usize;
+        let status = comp
+            .compress(&input[in_off..], tmp, FlushCompress::Finish)
+            .expect("zlib compress");
+        let consumed = (comp.total_in() as usize) - before_in;
+        let produced = (comp.total_out() as usize) - before_out;
+        in_off += consumed;
+        if produced > 0 {
+            out.extend_from_slice(&tmp[..produced]);
+        }
+        match status {
+            Status::StreamEnd => break,
+            Status::Ok | Status::BufError => {
+                if consumed == 0 && produced == 0 {
+                    let new_len = tmp.len() * 2;
+                    tmp.resize(new_len, 0);
+                }
+            }
+        }
+    }
+}
+
+fn build_pack(repo: &Repo, oids: &[Oid], best: bool) -> Vec<u8> {
     let mut out = Vec::with_capacity(64 + oids.len() * 128);
     out.extend_from_slice(b"PACK");
     out.extend_from_slice(&2u32.to_be_bytes());
     out.extend_from_slice(&(oids.len() as u32).to_be_bytes());
 
-    for oid in oids {
-        let Some(obj) = repo.objects.get(oid) else {
-            continue;
-        };
-        let code = obj.kind as u8;
-        let mut size = obj.data.len();
-        let mut first = (code << 4) | ((size & 0x0f) as u8);
-        size >>= 4;
-        while size > 0 {
-            out.push(first | 0x80);
-            first = (size & 0x7f) as u8;
-            size >>= 7;
-        }
-        out.push(first);
+    DEFLATE_SCRATCH.with(|cell| {
+        let mut scratch = cell.borrow_mut();
+        let DeflateScratch {
+            comp_fast,
+            comp_best,
+            tmp,
+        } = &mut *scratch;
+        let comp = if best { comp_best } else { comp_fast };
 
-        let mut enc = ZlibEncoder::new(out, level);
-        let _ = enc.write_all(&obj.data);
-        out = enc.finish().unwrap();
-    }
+        for oid in oids {
+            let Some(obj) = repo.objects.get(oid) else {
+                continue;
+            };
+            let code = obj.kind as u8;
+            let mut size = obj.data.len();
+            let mut first = (code << 4) | ((size & 0x0f) as u8);
+            size >>= 4;
+            while size > 0 {
+                out.push(first | 0x80);
+                first = (size & 0x7f) as u8;
+                size >>= 7;
+            }
+            out.push(first);
+
+            compress_zlib_into(comp, tmp, &obj.data, &mut out);
+        }
+    });
 
     let trailer: [u8; 20] = Sha1::digest(&out).into();
     out.extend_from_slice(&trailer);
@@ -884,6 +929,14 @@ fn write_sideband_pack(out: &mut Vec<u8>, pack: &[u8]) {
         out.extend_from_slice(&pack[off..off + take]);
         off += take;
     }
+}
+
+#[inline]
+fn write_pkt_parts(out: &mut Vec<u8>, a: &[u8], b: &[u8], c: &[u8]) {
+    write_pkt_len(out, 4 + a.len() + b.len() + c.len());
+    out.extend_from_slice(a);
+    out.extend_from_slice(b);
+    out.extend_from_slice(c);
 }
 
 struct PushCmd<'a> {
@@ -960,97 +1013,118 @@ fn handle_receive_pack(
     if !pack_bytes.is_empty() {
         if let Err(err) = unpack_into_repo(&mut repo, pack_bytes) {
             drop(repo);
-            let mut report = Vec::with_capacity(256);
-            let msg = format!("unpack {}\n", err);
-            write_pkt_line(&mut report, msg.as_bytes());
-            for c in &cmds {
-                let line = format!("ng {} unpacker error\n", c.ref_name);
-                write_pkt_line(&mut report, line.as_bytes());
-            }
-            report.extend_from_slice(b"0000");
-            return send_push_report(write_buf, sideband, &report);
+            return REPORT_SCRATCH.with(|cell| {
+                let mut report = cell.borrow_mut();
+                report.clear();
+                write_pkt_parts(&mut report, b"unpack ", err.as_bytes(), b"\n");
+                for c in &cmds {
+                    write_pkt_parts(&mut report, b"ng ", c.ref_name.as_bytes(), b" unpacker error\n");
+                }
+                report.extend_from_slice(b"0000");
+                send_push_report(write_buf, sideband, &report)
+            });
         }
     }
 
-    let mut report = Vec::with_capacity(128 + cmds.len() * 64);
-    write_pkt_line(&mut report, b"unpack ok\n");
+    REPORT_SCRATCH.with(|cell| {
+        let mut report = cell.borrow_mut();
+        report.clear();
+        write_pkt_line(&mut report, b"unpack ok\n");
 
-    let mut any_changed = false;
-    let mut single_patched_ref: Option<(&str, Oid)> = None;
+        let mut any_changed = false;
+        let mut single_patched_ref: Option<(&str, Oid)> = None;
 
-    for c in &cmds {
-        if c.new_oid == ZERO_OID {
-            // Delete ref
-            let cur = repo.refs.get(c.ref_name).copied().unwrap_or(ZERO_OID);
-            if cur == ZERO_OID || (c.old_oid != ZERO_OID && cur != c.old_oid) {
-                let line = format!("ng {} non-fast-forward\n", c.ref_name);
-                write_pkt_line(&mut report, line.as_bytes());
-            } else {
-                repo.refs.remove(c.ref_name);
-                any_changed = true;
-                let line = format!("ok {}\n", c.ref_name);
-                write_pkt_line(&mut report, line.as_bytes());
-            }
-        } else if c.old_oid == ZERO_OID {
-            // Create ref
-            if repo.refs.contains_key(c.ref_name) {
-                let line = format!("ng {} non-fast-forward\n", c.ref_name);
-                write_pkt_line(&mut report, line.as_bytes());
-            } else if !repo.objects.contains_key(&c.new_oid) {
-                let line = format!("ng {} missing object\n", c.ref_name);
-                write_pkt_line(&mut report, line.as_bytes());
-            } else {
-                repo.refs.insert(c.ref_name.to_owned(), c.new_oid);
-                any_changed = true;
-                let line = format!("ok {}\n", c.ref_name);
-                write_pkt_line(&mut report, line.as_bytes());
-            }
-        } else {
-            // Update ref: must match current and be fast-forward
-            let cur = repo.refs.get(c.ref_name).copied().unwrap_or(ZERO_OID);
-            let ok_ff = cur == c.old_oid
-                && cur != ZERO_OID
-                && repo.objects.contains_key(&c.new_oid)
-                && repo.is_ancestor(cur, c.new_oid);
-            if ok_ff {
-                repo.refs.insert(c.ref_name.to_owned(), c.new_oid);
-                any_changed = true;
-                if cmds.len() == 1 {
-                    single_patched_ref = Some((c.ref_name, c.new_oid));
+        for c in &cmds {
+            if c.new_oid == ZERO_OID {
+                // Delete ref
+                let cur = repo.refs.get(c.ref_name).copied().unwrap_or(ZERO_OID);
+                if cur == ZERO_OID || (c.old_oid != ZERO_OID && cur != c.old_oid) {
+                    write_pkt_parts(
+                        &mut report,
+                        b"ng ",
+                        c.ref_name.as_bytes(),
+                        b" non-fast-forward\n",
+                    );
+                } else {
+                    repo.refs.remove(c.ref_name);
+                    any_changed = true;
+                    write_pkt_parts(&mut report, b"ok ", c.ref_name.as_bytes(), b"\n");
                 }
-                let line = format!("ok {}\n", c.ref_name);
-                write_pkt_line(&mut report, line.as_bytes());
+            } else if c.old_oid == ZERO_OID {
+                // Create ref
+                if repo.refs.contains_key(c.ref_name) {
+                    write_pkt_parts(
+                        &mut report,
+                        b"ng ",
+                        c.ref_name.as_bytes(),
+                        b" non-fast-forward\n",
+                    );
+                } else if !repo.objects.contains_key(&c.new_oid) {
+                    write_pkt_parts(
+                        &mut report,
+                        b"ng ",
+                        c.ref_name.as_bytes(),
+                        b" missing object\n",
+                    );
+                } else {
+                    repo.refs.insert(c.ref_name.to_owned(), c.new_oid);
+                    any_changed = true;
+                    write_pkt_parts(&mut report, b"ok ", c.ref_name.as_bytes(), b"\n");
+                }
             } else {
-                let line = format!("ng {} non-fast-forward\n", c.ref_name);
-                write_pkt_line(&mut report, line.as_bytes());
+                // Update ref: must match current and be fast-forward
+                let cur = repo.refs.get(c.ref_name).copied().unwrap_or(ZERO_OID);
+                let ok_ff = cur == c.old_oid
+                    && cur != ZERO_OID
+                    && repo.objects.contains_key(&c.new_oid)
+                    && repo.is_ancestor(cur, c.new_oid);
+                if ok_ff {
+                    if let Some(slot) = repo.refs.get_mut(c.ref_name) {
+                        *slot = c.new_oid;
+                    } else {
+                        repo.refs.insert(c.ref_name.to_owned(), c.new_oid);
+                    }
+                    any_changed = true;
+                    if cmds.len() == 1 {
+                        single_patched_ref = Some((c.ref_name, c.new_oid));
+                    }
+                    write_pkt_parts(&mut report, b"ok ", c.ref_name.as_bytes(), b"\n");
+                } else {
+                    write_pkt_parts(
+                        &mut report,
+                        b"ng ",
+                        c.ref_name.as_bytes(),
+                        b" non-fast-forward\n",
+                    );
+                }
             }
         }
-    }
 
-    if any_changed {
-        repo.cache_ls_refs_full = None;
-        repo.cache_fetch_depth1 = None;
-        if let Some((ref_name, new_oid)) = single_patched_ref {
-            let mut patched = false;
-            if let Some(ref mut cache) = repo.cache_receive_refs {
-                if cache.single_ref_name.as_deref() == Some(ref_name) {
-                    let hex = oid_to_hex(&new_oid);
-                    cache.bytes[cache.oid_offset..cache.oid_offset + 40]
-                        .copy_from_slice(&hex);
-                    patched = true;
+        if any_changed {
+            repo.cache_ls_refs_full = None;
+            repo.cache_fetch_depth1 = None;
+            if let Some((ref_name, new_oid)) = single_patched_ref {
+                let mut patched = false;
+                if let Some(ref mut cache) = repo.cache_receive_refs {
+                    if cache.single_ref_name.as_deref() == Some(ref_name) {
+                        let hex = oid_to_hex(&new_oid);
+                        cache.bytes[cache.oid_offset..cache.oid_offset + 40]
+                            .copy_from_slice(&hex);
+                        patched = true;
+                    }
                 }
-            }
-            if !patched {
+                if !patched {
+                    repo.cache_receive_refs = None;
+                }
+            } else {
                 repo.cache_receive_refs = None;
             }
-        } else {
-            repo.cache_receive_refs = None;
         }
-    }
-    drop(repo);
+        drop(repo);
 
-    report.extend_from_slice(b"0000");
-    send_push_report(write_buf, sideband, &report)
+        report.extend_from_slice(b"0000");
+        send_push_report(write_buf, sideband, &report)
+    })
 }
 
 #[inline]
@@ -1059,11 +1133,22 @@ fn send_push_report(
     sideband: bool,
     report: &[u8],
 ) -> HttpResponse {
-    if sideband {
-        let mut framed = Vec::with_capacity(report.len() + 12);
-        write_pkt_len(&mut framed, 4 + 1 + report.len());
-        framed.push(1);
-        framed.extend_from_slice(report);
+    if sideband && report.len() <= PKT_MAX_SIDEBAND_PAYLOAD {
+        let body_len = 4 + 1 + report.len() + 4;
+        write_buf.clear();
+        write_buf.extend_from_slice(
+            b"HTTP/1.1 200 OK\r\nContent-Type: application/x-git-receive-pack-result\r\nX-GitHub-Request-Id: 1\r\nContent-Length: ",
+        );
+        crate::util::write_u64_ascii(write_buf, body_len as u64);
+        write_buf.extend_from_slice(b"\r\n\r\n");
+        write_pkt_len(write_buf, 4 + 1 + report.len());
+        write_buf.push(1);
+        write_buf.extend_from_slice(report);
+        write_buf.extend_from_slice(b"0000");
+        HttpResponse::Owned
+    } else if sideband {
+        let mut framed = Vec::with_capacity(report.len() + 16);
+        write_sideband_pack(&mut framed, report);
         framed.extend_from_slice(b"0000");
         write_raw_resp(
             write_buf,
@@ -1084,6 +1169,7 @@ fn send_push_report(
 }
 
 struct UnpackedEntry {
+    offset: usize,
     type_code: u8,
     base_offset: usize,
     base_oid: Oid,
@@ -1107,10 +1193,10 @@ fn unpack_into_repo(repo: &mut Repo, pack: &[u8]) -> Result<(), &'static str> {
     }
 
     let mut entries: Vec<UnpackedEntry> = Vec::with_capacity(count);
-    let mut by_offset: FxHashMap<usize, usize> = FxHashMap::default();
+    let mut has_deltas = false;
     let mut pos = 12usize;
 
-    for idx in 0..count {
+    for _idx in 0..count {
         let entry_offset = pos;
         if pos >= trailer_start {
             return Err("truncated pack entry");
@@ -1135,6 +1221,7 @@ fn unpack_into_repo(repo: &mut Repo, pack: &[u8]) -> Result<(), &'static str> {
         let mut base_oid = ZERO_OID;
 
         if type_code == 6 {
+            has_deltas = true;
             if pos >= trailer_start {
                 return Err("truncated ofs-delta");
             }
@@ -1154,6 +1241,7 @@ fn unpack_into_repo(repo: &mut Repo, pack: &[u8]) -> Result<(), &'static str> {
             }
             base_offset = entry_offset - val;
         } else if type_code == 7 {
+            has_deltas = true;
             if pos + 20 > trailer_start {
                 return Err("truncated ref-delta");
             }
@@ -1165,8 +1253,8 @@ fn unpack_into_repo(repo: &mut Repo, pack: &[u8]) -> Result<(), &'static str> {
 
         let (data, next_pos) = inflate_pack_entry(&pack[pos..trailer_start], expected_size)?;
         pos += next_pos;
-        by_offset.insert(entry_offset, idx);
         entries.push(UnpackedEntry {
+            offset: entry_offset,
             type_code,
             base_offset,
             base_oid,
@@ -1179,6 +1267,24 @@ fn unpack_into_repo(repo: &mut Repo, pack: &[u8]) -> Result<(), &'static str> {
         return Err("trailing bytes in pack");
     }
 
+    if !has_deltas {
+        for entry in entries {
+            let Some(kind) = ObjType::from_code(entry.type_code) else {
+                return Err("bad object type");
+            };
+            let oid = crate::store::hash_object(kind, &entry.data);
+            if !repo.objects.contains_key(&oid) {
+                repo.insert_known_object(oid, kind, entry.data);
+            }
+        }
+        return Ok(());
+    }
+
+    let mut by_offset: FxHashMap<usize, usize> =
+        FxHashMap::with_capacity_and_hasher(entries.len(), Default::default());
+    for (idx, e) in entries.iter().enumerate() {
+        by_offset.insert(e.offset, idx);
+    }
     let mut resolved_by_oid: OidMap<usize> = OidMap::default();
     for idx in 0..entries.len() {
         resolve_pack_entry(idx, &mut entries, &by_offset, &mut resolved_by_oid, repo)?;

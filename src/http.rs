@@ -6,8 +6,8 @@ use crate::util::write_u64_ascii;
 const MAX_HEADER_BYTES: usize = 64 * 1024;
 const MAX_BODY_BYTES: usize = 32 * 1024 * 1024;
 const MAX_BUF_BYTES: usize = MAX_BODY_BYTES + MAX_HEADER_BYTES + 4096;
-pub const INITIAL_CONN_READ_CAP: usize = 4096;
-pub const SHRINK_THRESHOLD: usize = 65536;
+pub const INITIAL_CONN_READ_CAP: usize = 16 * 1024;
+pub const SHRINK_THRESHOLD: usize = 256 * 1024;
 
 pub const HEALTHZ_RESP: &[u8] =
     b"HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nX-GitHub-Request-Id: 1\r\nContent-Length: 11\r\n\r\n{\"ok\":true}";
@@ -107,6 +107,17 @@ impl ReadState {
     }
 
     #[inline]
+    pub fn reset_for_new_conn(&mut self) {
+        self.pos = 0;
+        self.len = 0;
+        self.header = None;
+        if self.buf.len() > SHRINK_THRESHOLD {
+            self.buf.truncate(INITIAL_CONN_READ_CAP);
+            self.buf.shrink_to(INITIAL_CONN_READ_CAP);
+        }
+    }
+
+    #[inline]
     pub fn advance(&mut self, next_pos: usize) {
         self.pos = next_pos;
         self.header = None;
@@ -161,13 +172,15 @@ fn find_header_end(buf: &[u8]) -> Option<usize> {
     if buf.len() < 4 {
         return None;
     }
-    let mut i = 0;
-    let limit = buf.len() - 3;
+    let mut i = 1usize;
+    let limit = buf.len() - 2;
     while i < limit {
-        if buf[i] == b'\r' && buf[i + 1] == b'\n' && buf[i + 2] == b'\r' && buf[i + 3] == b'\n' {
-            return Some(i);
+        let rel = buf[i..limit].iter().position(|&b| b == b'\n')?;
+        let pos = i + rel;
+        if buf[pos - 1] == b'\r' && buf[pos + 1] == b'\r' && buf[pos + 2] == b'\n' {
+            return Some(pos - 1);
         }
-        i += 1;
+        i = pos + 1;
     }
     None
 }
@@ -241,10 +254,17 @@ pub fn try_parse_request(rs: &mut ReadState) -> ParseResult {
         let body_start = hdr_end + 4;
         let hdr_bytes = &rs.buf[base..hdr_end];
 
-        let line_end = hdr_bytes
-            .windows(2)
-            .position(|w| w == b"\r\n")
-            .unwrap_or(hdr_bytes.len());
+        let (line_end, mut cur) = match hdr_bytes.iter().position(|&b| b == b'\n') {
+            Some(lf) => {
+                let end = if lf > 0 && hdr_bytes[lf - 1] == b'\r' {
+                    lf - 1
+                } else {
+                    lf
+                };
+                (end, lf + 1)
+            }
+            None => (hdr_bytes.len(), hdr_bytes.len()),
+        };
         let req_line = &hdr_bytes[..line_end];
 
         let Some(sp1) = req_line.iter().position(|&b| b == b' ') else {
@@ -289,46 +309,91 @@ pub fn try_parse_request(rs: &mut ReadState) -> ParseResult {
         let mut conn_close = false;
         let mut conn_keep = false;
 
-        let mut cur = line_end + 2;
         while cur < hdr_bytes.len() {
-            let next_crlf = hdr_bytes[cur..]
-                .windows(2)
-                .position(|w| w == b"\r\n")
-                .unwrap_or(hdr_bytes.len() - cur);
-            let line = &hdr_bytes[cur..cur + next_crlf];
+            let (line_rel_end, next_cur) = match hdr_bytes[cur..].iter().position(|&b| b == b'\n') {
+                Some(lf) => {
+                    let end = if lf > 0 && hdr_bytes[cur + lf - 1] == b'\r' {
+                        lf - 1
+                    } else {
+                        lf
+                    };
+                    (end, cur + lf + 1)
+                }
+                None => (hdr_bytes.len() - cur, hdr_bytes.len()),
+            };
+            let line = &hdr_bytes[cur..cur + line_rel_end];
             if let Some(colon) = line.iter().position(|&b| b == b':') {
                 let name = &line[..colon];
-                let (vs, ve) = trim_ascii(
-                    rs.buf.as_slice(),
-                    base + cur + colon + 1,
-                    base + cur + next_crlf,
-                );
-                let val = &rs.buf[vs..ve];
-                if name.eq_ignore_ascii_case(b"content-length") {
-                    content_length = parse_usize_ascii(val);
-                } else if name.eq_ignore_ascii_case(b"authorization") {
-                    authorization = Some(Span { start: vs, end: ve });
-                } else if name.eq_ignore_ascii_case(b"host") {
-                    host = Some(Span { start: vs, end: ve });
-                } else if name.eq_ignore_ascii_case(b"git-protocol") {
-                    git_protocol = Some(Span { start: vs, end: ve });
-                } else if name.eq_ignore_ascii_case(b"transfer-encoding") {
-                    if contains_ignore_ascii_case(val, b"chunked") {
-                        chunked = true;
+                match name.len() {
+                    4 if name.eq_ignore_ascii_case(b"host") => {
+                        let (vs, ve) = trim_ascii(
+                            rs.buf.as_slice(),
+                            base + cur + colon + 1,
+                            base + cur + line_rel_end,
+                        );
+                        host = Some(Span { start: vs, end: ve });
                     }
-                } else if name.eq_ignore_ascii_case(b"connection") {
-                    if contains_ignore_ascii_case(val, b"close") {
-                        conn_close = true;
-                    } else if contains_ignore_ascii_case(val, b"keep-alive") {
-                        conn_keep = true;
+                    6 if name.eq_ignore_ascii_case(b"expect") => {
+                        let (vs, ve) = trim_ascii(
+                            rs.buf.as_slice(),
+                            base + cur + colon + 1,
+                            base + cur + line_rel_end,
+                        );
+                        if contains_ignore_ascii_case(&rs.buf[vs..ve], b"100-continue") {
+                            expect_100 = true;
+                        }
                     }
-                } else if name.eq_ignore_ascii_case(b"expect") {
-                    if contains_ignore_ascii_case(val, b"100-continue") {
-                        expect_100 = true;
+                    10 if name.eq_ignore_ascii_case(b"connection") => {
+                        let (vs, ve) = trim_ascii(
+                            rs.buf.as_slice(),
+                            base + cur + colon + 1,
+                            base + cur + line_rel_end,
+                        );
+                        let val = &rs.buf[vs..ve];
+                        if contains_ignore_ascii_case(val, b"close") {
+                            conn_close = true;
+                        } else if contains_ignore_ascii_case(val, b"keep-alive") {
+                            conn_keep = true;
+                        }
                     }
+                    12 if name.eq_ignore_ascii_case(b"git-protocol") => {
+                        let (vs, ve) = trim_ascii(
+                            rs.buf.as_slice(),
+                            base + cur + colon + 1,
+                            base + cur + line_rel_end,
+                        );
+                        git_protocol = Some(Span { start: vs, end: ve });
+                    }
+                    13 if name.eq_ignore_ascii_case(b"authorization") => {
+                        let (vs, ve) = trim_ascii(
+                            rs.buf.as_slice(),
+                            base + cur + colon + 1,
+                            base + cur + line_rel_end,
+                        );
+                        authorization = Some(Span { start: vs, end: ve });
+                    }
+                    14 if name.eq_ignore_ascii_case(b"content-length") => {
+                        let (vs, ve) = trim_ascii(
+                            rs.buf.as_slice(),
+                            base + cur + colon + 1,
+                            base + cur + line_rel_end,
+                        );
+                        content_length = parse_usize_ascii(&rs.buf[vs..ve]);
+                    }
+                    17 if name.eq_ignore_ascii_case(b"transfer-encoding") => {
+                        let (vs, ve) = trim_ascii(
+                            rs.buf.as_slice(),
+                            base + cur + colon + 1,
+                            base + cur + line_rel_end,
+                        );
+                        if contains_ignore_ascii_case(&rs.buf[vs..ve], b"chunked") {
+                            chunked = true;
+                        }
+                    }
+                    _ => {}
                 }
             }
-            cur += next_crlf + 2;
+            cur = next_cur;
         }
 
         let keep_alive = if conn_close {

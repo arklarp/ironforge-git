@@ -24,16 +24,6 @@ pub enum ObjType {
 
 impl ObjType {
     #[inline]
-    pub fn as_str(self) -> &'static str {
-        match self {
-            ObjType::Commit => "commit",
-            ObjType::Tree => "tree",
-            ObjType::Blob => "blob",
-            ObjType::Tag => "tag",
-        }
-    }
-
-    #[inline]
     pub fn from_code(code: u8) -> Option<Self> {
         match code {
             1 => Some(ObjType::Commit),
@@ -707,11 +697,25 @@ pub struct StoreInner {
 pub struct Store {
     pub token: String,
     pub inner: RwLock<StoreInner>,
+    pub repo_generation: AtomicU64,
     pub next_repo_id: AtomicU64,
     pub next_issue_id: AtomicU64,
     pub next_pr_id: AtomicU64,
     pub next_comment_id: AtomicU64,
     pub commit_seq: AtomicU64,
+}
+
+struct RepoCacheEntry {
+    store_ptr: usize,
+    generation: u64,
+    owner: String,
+    name: String,
+    repo: Arc<RwLock<Repo>>,
+}
+
+thread_local! {
+    static REPO_TLS_CACHE: std::cell::RefCell<Option<RepoCacheEntry>> =
+        const { std::cell::RefCell::new(None) };
 }
 
 impl Store {
@@ -724,6 +728,7 @@ impl Store {
                 repo_order: Vec::new(),
                 repo_by_id: FxHashMap::default(),
             }),
+            repo_generation: AtomicU64::new(1),
             next_repo_id: AtomicU64::new(1001),
             next_issue_id: AtomicU64::new(10001),
             next_pr_id: AtomicU64::new(20001),
@@ -750,11 +755,56 @@ impl Store {
 
     #[inline]
     pub fn get_repo_arc(&self, owner: &str, name: &str) -> Option<Arc<RwLock<Repo>>> {
-        let g = self.inner.read().unwrap();
-        if owner != g.owner_login {
-            return None;
+        let store_ptr = self as *const Store as usize;
+        let repo_gen = self.repo_generation.load(Ordering::Acquire);
+        let hit = REPO_TLS_CACHE.with(|cell| {
+            let borrow = cell.borrow();
+            if let Some(ref entry) = *borrow {
+                if entry.store_ptr == store_ptr
+                    && entry.generation == repo_gen
+                    && entry.owner == owner
+                    && entry.name == name
+                {
+                    return Some(Arc::clone(&entry.repo));
+                }
+            }
+            None
+        });
+        if let Some(repo) = hit {
+            return Some(repo);
         }
-        g.repos.get(name).cloned()
+
+        let (gen_inside, repo) = {
+            let g = self.inner.read().unwrap();
+            if owner != g.owner_login {
+                return None;
+            }
+            let repo = g.repos.get(name)?.clone();
+            let gen_inside = self.repo_generation.load(Ordering::Acquire);
+            (gen_inside, repo)
+        };
+
+        REPO_TLS_CACHE.with(|cell| {
+            let mut borrow = cell.borrow_mut();
+            if let Some(ref mut entry) = *borrow {
+                entry.store_ptr = store_ptr;
+                entry.generation = gen_inside;
+                entry.owner.clear();
+                entry.owner.push_str(owner);
+                entry.name.clear();
+                entry.name.push_str(name);
+                entry.repo = Arc::clone(&repo);
+            } else {
+                *borrow = Some(RepoCacheEntry {
+                    store_ptr,
+                    generation: gen_inside,
+                    owner: owner.to_owned(),
+                    name: name.to_owned(),
+                    repo: Arc::clone(&repo),
+                });
+            }
+        });
+        Some(repo)
     }
 
     pub fn get_repo(&self, owner: &str, name: &str) -> Option<(String, Arc<RwLock<Repo>>)> {
@@ -782,6 +832,7 @@ impl Store {
         g.repos.insert(name.clone(), repo.clone());
         g.repo_order.push(name.clone());
         g.repo_by_id.insert(id, name);
+        self.repo_generation.fetch_add(1, Ordering::Release);
         Ok((owner, repo))
     }
 
@@ -796,6 +847,7 @@ impl Store {
             if let Some(pos) = g.repo_order.iter().position(|n| n == name) {
                 g.repo_order.remove(pos);
             }
+            self.repo_generation.fetch_add(1, Ordering::Release);
             true
         } else {
             false
@@ -849,9 +901,36 @@ pub fn decode_pr_gid(gid: &str) -> Option<(u64, u32)> {
 
 #[inline]
 pub fn hash_object(kind: ObjType, data: &[u8]) -> Oid {
+    let prefix: &[u8] = match kind {
+        ObjType::Commit => b"commit ",
+        ObjType::Tree => b"tree ",
+        ObjType::Blob => b"blob ",
+        ObjType::Tag => b"tag ",
+    };
+    let mut hdr = [0u8; 32];
+    hdr[..prefix.len()].copy_from_slice(prefix);
+    let mut pos = prefix.len();
+    let mut n = data.len();
+    if n == 0 {
+        hdr[pos] = b'0';
+        pos += 1;
+    } else {
+        let mut digits = [0u8; 20];
+        let mut dpos = 20;
+        while n > 0 {
+            dpos -= 1;
+            digits[dpos] = b'0' + (n % 10) as u8;
+            n /= 10;
+        }
+        let dlen = 20 - dpos;
+        hdr[pos..pos + dlen].copy_from_slice(&digits[dpos..]);
+        pos += dlen;
+    }
+    hdr[pos] = 0;
+    pos += 1;
+
     let mut hasher = Sha1::new();
-    let header = format!("{} {}\0", kind.as_str(), data.len());
-    hasher.update(header.as_bytes());
+    hasher.update(&hdr[..pos]);
     hasher.update(data);
     hasher.finalize().into()
 }
