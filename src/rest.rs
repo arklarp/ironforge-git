@@ -1,5 +1,4 @@
 use std::borrow::Cow;
-use std::cell::RefCell;
 use std::sync::atomic::Ordering;
 use std::sync::Arc;
 
@@ -16,10 +15,6 @@ use crate::util::{
     b64_decode, b64_encode, hex_to_oid, parse_fast_issue_body, parse_query_param,
     percent_decode_path, write_json_str, write_oid_hex, write_u64_ascii, Oid, OidSet,
 };
-
-thread_local! {
-    static ISSUE_JSON_BUF: RefCell<Vec<u8>> = RefCell::new(Vec::with_capacity(512));
-}
 
 pub fn handle_rest(
     write_buf: &mut Vec<u8>,
@@ -390,6 +385,10 @@ fn fast_create_issue_arc(
             }
         }
     }
+    if repo.issues.is_empty() {
+        repo.issues.reserve(1024);
+        repo.issue_http_cache.reserve(1024);
+    }
     let id = store.next_issue_id.fetch_add(1, Ordering::Relaxed);
     let number = (repo.issues.len() + 1) as u32;
     let issue = Issue {
@@ -404,22 +403,47 @@ fn fast_create_issue_arc(
         seq: id,
     };
 
-    ISSUE_JSON_BUF.with(|cell| {
-        let mut json_buf = cell.borrow_mut();
-        json_buf.clear();
-        format_issue_json(&mut json_buf, &issue);
-        repo.issues.push(issue);
-        repo.issue_http_cache.push(None);
-        drop(repo);
+    write_buf.clear();
+    write_buf.extend_from_slice(
+        b"HTTP/1.1 201 Created\r\nContent-Type: application/json\r\nX-GitHub-Request-Id: 1\r\nContent-Length:       \r\n\r\n",
+    );
+    let cl_end = write_buf.len() - 4;
+    let body_start = write_buf.len();
+    format_issue_json(write_buf, &issue);
+    repo.issues.push(issue);
+    repo.issue_http_cache.push(None);
+    drop(repo);
 
-        write_buf.clear();
-        write_buf
-            .extend_from_slice(b"HTTP/1.1 201 Created\r\nContent-Type: application/json\r\nX-GitHub-Request-Id: 1\r\nContent-Length: ");
-        write_u64_ascii(write_buf, json_buf.len() as u64);
-        write_buf.extend_from_slice(b"\r\n\r\n");
-        write_buf.extend_from_slice(&json_buf);
-        HttpResponse::Owned
-    })
+    let body_len = write_buf.len() - body_start;
+    if body_len <= 999_999 {
+        let mut n = body_len;
+        let mut p = cl_end;
+        loop {
+            p -= 1;
+            write_buf[p] = b'0' + (n % 10) as u8;
+            n /= 10;
+            if n == 0 {
+                break;
+            }
+        }
+    } else {
+        let mut digits = [0u8; 20];
+        let mut dpos = 20;
+        let mut n = body_len;
+        while n > 0 {
+            dpos -= 1;
+            digits[dpos] = b'0' + (n % 10) as u8;
+            n /= 10;
+        }
+        let dlen = 20 - dpos;
+        let extra = dlen - 6;
+        write_buf.resize(body_start + body_len + extra, 0);
+        write_buf.copy_within(body_start..body_start + body_len, body_start + extra);
+        let new_cl_end = cl_end + extra;
+        write_buf[cl_end - 6..new_cl_end].copy_from_slice(&digits[dpos..]);
+        write_buf[new_cl_end..new_cl_end + 4].copy_from_slice(b"\r\n\r\n");
+    }
+    HttpResponse::Owned
 }
 
 fn list_user_repos(

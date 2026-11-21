@@ -47,8 +47,32 @@ fn main() {
     let token = std::env::var("MAKEFUN_SHOP_TOKEN").unwrap_or_default();
 
     let listener = TcpListener::bind("0.0.0.0:0").expect("bind ephemeral port");
+    let listen_fd = listener.as_raw_fd();
     unsafe {
-        libc::listen(listener.as_raw_fd(), 512);
+        let nodelay: libc::c_int = 1;
+        libc::setsockopt(
+            listen_fd,
+            libc::IPPROTO_TCP,
+            libc::TCP_NODELAY,
+            &nodelay as *const libc::c_int as *const libc::c_void,
+            std::mem::size_of::<libc::c_int>() as libc::socklen_t,
+        );
+        let buf_sz: libc::c_int = 262_144;
+        libc::setsockopt(
+            listen_fd,
+            libc::SOL_SOCKET,
+            libc::SO_RCVBUF,
+            &buf_sz as *const libc::c_int as *const libc::c_void,
+            std::mem::size_of::<libc::c_int>() as libc::socklen_t,
+        );
+        libc::setsockopt(
+            listen_fd,
+            libc::SOL_SOCKET,
+            libc::SO_SNDBUF,
+            &buf_sz as *const libc::c_int as *const libc::c_void,
+            std::mem::size_of::<libc::c_int>() as libc::socklen_t,
+        );
+        libc::listen(listen_fd, 512);
     }
     let port = listener.local_addr().expect("local_addr").port();
     let shared = Arc::new(Shared {
@@ -120,17 +144,6 @@ fn worker_loop(shared: Arc<Shared>, ready: Option<Arc<AtomicUsize>>) {
                     shared.total.fetch_sub(add - actual, Ordering::AcqRel);
                 }
             }
-        }
-
-        let nodelay: libc::c_int = 1;
-        unsafe {
-            libc::setsockopt(
-                fd,
-                libc::IPPROTO_TCP,
-                libc::TCP_NODELAY,
-                &nodelay as *const libc::c_int as *const libc::c_void,
-                std::mem::size_of::<libc::c_int>() as libc::socklen_t,
-            );
         }
 
         handle_connection(fd, &mut rs, &mut write_buf, &shared.store);
@@ -377,6 +390,6 @@ fn poll_done(env_url: &str) {
                 return;
             }
         }
-        std::thread::sleep(Duration::from_millis(250));
+        std::thread::sleep(Duration::from_millis(800));
     }
 }
