@@ -1,10 +1,11 @@
-use std::io::{self, Write};
-use std::net::TcpStream;
+use std::borrow::Cow;
+use std::cell::RefCell;
 use std::sync::atomic::Ordering;
+use std::sync::Arc;
 
 use crate::http::{
-    host_str, write_json_message, write_json_resp, write_preframed, BAD_JSON_RESP,
-    NOT_FOUND_RESP, NO_CONTENT_RESP, UNAUTH_RESP,
+    host_str, write_json_message, write_json_resp, HttpResponse, BAD_JSON_RESP, NOT_FOUND_RESP,
+    NO_CONTENT_RESP, UNAUTH_RESP,
 };
 use crate::store::{
     build_commit, format_issue_json, format_pr_json, format_repo_json, parse_commit_message,
@@ -16,8 +17,11 @@ use crate::util::{
     percent_decode_path, write_json_str, write_oid_hex, write_u64_ascii, Oid, OidSet,
 };
 
+thread_local! {
+    static ISSUE_JSON_BUF: RefCell<Vec<u8>> = RefCell::new(Vec::with_capacity(512));
+}
+
 pub fn handle_rest(
-    stream: &mut TcpStream,
     write_buf: &mut Vec<u8>,
     store: &Store,
     method: &[u8],
@@ -26,9 +30,9 @@ pub fn handle_rest(
     auth: Option<&[u8]>,
     host: Option<&[u8]>,
     body: &[u8],
-) -> io::Result<()> {
+) -> HttpResponse {
     if !store.check_auth(auth) {
-        return write_preframed(stream, UNAUTH_RESP);
+        return HttpResponse::Static(UNAUTH_RESP);
     }
 
     // Hot paths for bench.read and bench.write: /api/v3/repos/{owner}/{repo}/issues[/{n}]
@@ -49,11 +53,11 @@ pub fn handle_rest(
                                 if let Ok(num) =
                                     unsafe { std::str::from_utf8_unchecked(num_b) }.parse::<u32>()
                                 {
-                                    return fast_get_issue(stream, store, owner, repo_name, num);
+                                    return fast_get_issue(store, owner, repo_name, num);
                                 }
                             }
                         } else if method == b"POST" && tail == b"/issues" {
-                            return fast_create_issue(stream, write_buf, store, owner, repo_name, body);
+                            return fast_create_issue(write_buf, store, owner, repo_name, body);
                         }
                     }
                 }
@@ -64,7 +68,6 @@ pub fn handle_rest(
     // Root and metadata endpoints
     if method == b"GET" && (path == b"/api/v3" || path == b"/api/v3/") {
         return write_json_resp(
-            stream,
             write_buf,
             200,
             b"X-OAuth-Scopes: repo, read:org\r\n",
@@ -73,7 +76,6 @@ pub fn handle_rest(
     }
     if method == b"GET" && path == b"/api/v3/meta" {
         return write_json_resp(
-            stream,
             write_buf,
             200,
             b"",
@@ -86,21 +88,21 @@ pub fn handle_rest(
         json.extend_from_slice(b"{\"login\":");
         write_json_str(&mut json, &login);
         json.extend_from_slice(b",\"id\":1000}");
-        return write_json_resp(stream, write_buf, 200, b"", &json);
+        return write_json_resp(write_buf, 200, b"", &json);
     }
     if path == b"/api/v3/user/repos" {
         return match method {
-            b"GET" => list_user_repos(stream, write_buf, store, query, host),
-            b"POST" => create_user_repo(stream, write_buf, store, body),
-            _ => write_preframed(stream, NOT_FOUND_RESP),
+            b"GET" => list_user_repos(write_buf, store, query, host),
+            b"POST" => create_user_repo(write_buf, store, body),
+            _ => HttpResponse::Static(NOT_FOUND_RESP),
         };
     }
 
     let Some(after_repos) = path.strip_prefix(b"/api/v3/repos/") else {
-        return write_preframed(stream, NOT_FOUND_RESP);
+        return HttpResponse::Static(NOT_FOUND_RESP);
     };
     let Some(s1) = after_repos.iter().position(|&b| b == b'/') else {
-        return write_preframed(stream, NOT_FOUND_RESP);
+        return HttpResponse::Static(NOT_FOUND_RESP);
     };
     let owner = percent_decode_path(&after_repos[..s1]);
     let rem1 = &after_repos[s1 + 1..];
@@ -113,29 +115,29 @@ pub fn handle_rest(
         return match method {
             b"DELETE" => {
                 if store.delete_repo(&owner, &repo_name) {
-                    write_preframed(stream, NO_CONTENT_RESP)
+                    HttpResponse::Static(NO_CONTENT_RESP)
                 } else {
-                    write_preframed(stream, NOT_FOUND_RESP)
+                    HttpResponse::Static(NOT_FOUND_RESP)
                 }
             }
             b"GET" => {
-                let Some((owner_login, repo_arc)) = store.get_repo(&owner, &repo_name) else {
-                    return write_preframed(stream, NOT_FOUND_RESP);
+                let Some(repo_arc) = store.get_repo_arc(&owner, &repo_name) else {
+                    return HttpResponse::Static(NOT_FOUND_RESP);
                 };
                 let repo = repo_arc.read().unwrap();
                 let mut json = Vec::with_capacity(256);
-                format_repo_json(&mut json, &owner_login, &repo);
-                write_json_resp(stream, write_buf, 200, b"", &json)
+                format_repo_json(&mut json, &owner, &repo);
+                write_json_resp(write_buf, 200, b"", &json)
             }
             b"PATCH" => {
                 let Ok(val) = serde_json::from_slice::<serde_json::Value>(body) else {
-                    return write_preframed(stream, BAD_JSON_RESP);
+                    return HttpResponse::Static(BAD_JSON_RESP);
                 };
                 let Some(obj) = val.as_object() else {
-                    return write_preframed(stream, BAD_JSON_RESP);
+                    return HttpResponse::Static(BAD_JSON_RESP);
                 };
-                let Some((owner_login, repo_arc)) = store.get_repo(&owner, &repo_name) else {
-                    return write_preframed(stream, NOT_FOUND_RESP);
+                let Some(repo_arc) = store.get_repo_arc(&owner, &repo_name) else {
+                    return HttpResponse::Static(NOT_FOUND_RESP);
                 };
                 let mut repo = repo_arc.write().unwrap();
                 if let Some(desc) = obj.get("description").and_then(|v| v.as_str()) {
@@ -150,27 +152,27 @@ pub fn handle_rest(
                     }
                 }
                 let mut json = Vec::with_capacity(256);
-                format_repo_json(&mut json, &owner_login, &repo);
-                write_json_resp(stream, write_buf, 200, b"", &json)
+                format_repo_json(&mut json, &owner, &repo);
+                write_json_resp(write_buf, 200, b"", &json)
             }
-            _ => write_preframed(stream, NOT_FOUND_RESP),
+            _ => HttpResponse::Static(NOT_FOUND_RESP),
         };
     }
 
-    let Some((owner_login, repo_arc)) = store.get_repo(&owner, &repo_name) else {
-        return write_preframed(stream, NOT_FOUND_RESP);
+    let Some(repo_arc) = store.get_repo_arc(&owner, &repo_name) else {
+        return HttpResponse::Static(NOT_FOUND_RESP);
     };
 
     // Route remaining /repos/{o}/{r}/... endpoints
     if method == b"POST" && tail_bytes == b"/git/refs" {
-        return create_git_ref(stream, write_buf, &repo_arc, body);
+        return create_git_ref(write_buf, &repo_arc, body);
     }
     if method == b"GET" && tail_bytes.starts_with(b"/git/refs/") {
         let sub = percent_decode_path(&tail_bytes[b"/git/refs/".len()..]);
         let full_ref = format!("refs/{}", sub);
         let repo = repo_arc.read().unwrap();
         let Some(&oid) = repo.refs.get(&full_ref) else {
-            return write_preframed(stream, NOT_FOUND_RESP);
+            return HttpResponse::Static(NOT_FOUND_RESP);
         };
         let mut json = Vec::with_capacity(128);
         json.extend_from_slice(b"{\"ref\":");
@@ -178,7 +180,7 @@ pub fn handle_rest(
         json.extend_from_slice(b",\"object\":{\"sha\":\"");
         write_oid_hex(&oid, &mut json);
         json.extend_from_slice(b"\",\"type\":\"commit\"}}");
-        return write_json_resp(stream, write_buf, 200, b"", &json);
+        return write_json_resp(write_buf, 200, b"", &json);
     }
     if method == b"GET" && tail_bytes == b"/branches" {
         let repo = repo_arc.read().unwrap();
@@ -199,13 +201,13 @@ pub fn handle_rest(
             }
         }
         json.push(b']');
-        return write_json_resp(stream, write_buf, 200, b"", &json);
+        return write_json_resp(write_buf, 200, b"", &json);
     }
     if method == b"GET" && tail_bytes.starts_with(b"/branches/") {
         let br = percent_decode_path(&tail_bytes[b"/branches/".len()..]);
         let repo = repo_arc.read().unwrap();
         let Some(&oid) = repo.refs.get(&format!("refs/heads/{}", br)) else {
-            return write_preframed(stream, NOT_FOUND_RESP);
+            return HttpResponse::Static(NOT_FOUND_RESP);
         };
         let mut json = Vec::with_capacity(128);
         json.extend_from_slice(b"{\"name\":");
@@ -213,170 +215,167 @@ pub fn handle_rest(
         json.extend_from_slice(b",\"commit\":{\"sha\":\"");
         write_oid_hex(&oid, &mut json);
         json.extend_from_slice(b"\"}}");
-        return write_json_resp(stream, write_buf, 200, b"", &json);
+        return write_json_resp(write_buf, 200, b"", &json);
     }
     if method == b"GET" && tail_bytes == b"/commits" {
-        return list_commits(stream, write_buf, &repo_arc, query);
+        return list_commits(write_buf, &repo_arc, query);
     }
     if tail_bytes == b"/contents" || tail_bytes.starts_with(b"/contents/") {
-        let file_path = if tail_bytes.len() > b"/contents/".len() {
+        let file_path: Cow<'_, str> = if tail_bytes.len() > b"/contents/".len() {
             percent_decode_path(&tail_bytes[b"/contents/".len()..])
         } else {
-            String::new()
+            Cow::Borrowed("")
         };
         return match method {
-            b"GET" => get_contents(stream, write_buf, &repo_arc, &file_path, query),
-            b"PUT" => put_contents(stream, write_buf, store, &owner_login, &repo_arc, &file_path, body),
-            b"DELETE" => {
-                delete_contents(stream, write_buf, store, &owner_login, &repo_arc, &file_path, body)
-            }
-            _ => write_preframed(stream, NOT_FOUND_RESP),
+            b"GET" => get_contents(write_buf, &repo_arc, &file_path, query),
+            b"PUT" => put_contents(write_buf, store, &owner, &repo_arc, &file_path, body),
+            b"DELETE" => delete_contents(write_buf, store, &owner, &repo_arc, &file_path, body),
+            _ => HttpResponse::Static(NOT_FOUND_RESP),
         };
     }
     if method == b"POST" && tail_bytes == b"/labels" {
-        return create_label(stream, write_buf, &repo_arc, body);
+        return create_label(write_buf, &repo_arc, body);
     }
     if tail_bytes == b"/issues" {
         return match method {
-            b"GET" => list_issues(stream, write_buf, &repo_arc, query),
-            b"POST" => fast_create_issue_arc(stream, write_buf, store, &repo_arc, body),
-            _ => write_preframed(stream, NOT_FOUND_RESP),
+            b"GET" => list_issues(write_buf, &repo_arc, query),
+            b"POST" => fast_create_issue_arc(write_buf, store, &repo_arc, body),
+            _ => HttpResponse::Static(NOT_FOUND_RESP),
         };
     }
     if let Some(after_issues) = tail_bytes.strip_prefix(b"/issues/") {
         if let Some(slash) = after_issues.iter().position(|&b| b == b'/') {
             let num_str = std::str::from_utf8(&after_issues[..slash]).unwrap_or("");
             let Ok(num) = num_str.parse::<u32>() else {
-                return write_preframed(stream, NOT_FOUND_RESP);
+                return HttpResponse::Static(NOT_FOUND_RESP);
             };
             let sub = &after_issues[slash..];
             if sub == b"/comments" {
                 return match method {
-                    b"GET" => list_comments(stream, write_buf, &repo_arc, num),
-                    b"POST" => create_comment(stream, write_buf, store, &repo_arc, num, body),
-                    _ => write_preframed(stream, NOT_FOUND_RESP),
+                    b"GET" => list_comments(write_buf, &repo_arc, num),
+                    b"POST" => create_comment(write_buf, store, &repo_arc, num, body),
+                    _ => HttpResponse::Static(NOT_FOUND_RESP),
                 };
             }
-            return write_preframed(stream, NOT_FOUND_RESP);
+            return HttpResponse::Static(NOT_FOUND_RESP);
         } else {
             let num_str = std::str::from_utf8(after_issues).unwrap_or("");
             let Ok(num) = num_str.parse::<u32>() else {
-                return write_preframed(stream, NOT_FOUND_RESP);
+                return HttpResponse::Static(NOT_FOUND_RESP);
             };
             return match method {
-                b"GET" => get_issue_arc(stream, &repo_arc, num),
-                b"PATCH" => patch_issue(stream, write_buf, &repo_arc, num, body),
-                _ => write_preframed(stream, NOT_FOUND_RESP),
+                b"GET" => get_issue_arc(&repo_arc, num),
+                b"PATCH" => patch_issue(write_buf, &repo_arc, num, body),
+                _ => HttpResponse::Static(NOT_FOUND_RESP),
             };
         }
     }
 
     if tail_bytes == b"/pulls" {
         return match method {
-            b"GET" => list_pulls(stream, write_buf, &repo_arc, query),
-            b"POST" => create_pull(stream, write_buf, store, &repo_arc, body),
-            _ => write_preframed(stream, NOT_FOUND_RESP),
+            b"GET" => list_pulls(write_buf, &repo_arc, query),
+            b"POST" => create_pull(write_buf, store, &repo_arc, body),
+            _ => HttpResponse::Static(NOT_FOUND_RESP),
         };
     }
     if let Some(after_pulls) = tail_bytes.strip_prefix(b"/pulls/") {
         if let Some(slash) = after_pulls.iter().position(|&b| b == b'/') {
             let num_str = std::str::from_utf8(&after_pulls[..slash]).unwrap_or("");
             let Ok(num) = num_str.parse::<u32>() else {
-                return write_preframed(stream, NOT_FOUND_RESP);
+                return HttpResponse::Static(NOT_FOUND_RESP);
             };
             let sub = &after_pulls[slash..];
             if method == b"GET" && sub == b"/files" {
-                return list_pull_files(stream, write_buf, &repo_arc, num);
+                return list_pull_files(write_buf, &repo_arc, num);
             }
             if method == b"PUT" && sub == b"/merge" {
-                return merge_pull(stream, write_buf, store, &owner_login, &repo_arc, num, body);
+                return merge_pull(write_buf, store, &owner, &repo_arc, num, body);
             }
-            return write_preframed(stream, NOT_FOUND_RESP);
+            return HttpResponse::Static(NOT_FOUND_RESP);
         } else if method == b"GET" {
             let num_str = std::str::from_utf8(after_pulls).unwrap_or("");
             let Ok(num) = num_str.parse::<u32>() else {
-                return write_preframed(stream, NOT_FOUND_RESP);
+                return HttpResponse::Static(NOT_FOUND_RESP);
             };
             let repo = repo_arc.read().unwrap();
             let Some(pr) = num.checked_sub(1).and_then(|i| repo.pulls.get(i as usize)) else {
-                return write_preframed(stream, NOT_FOUND_RESP);
+                return HttpResponse::Static(NOT_FOUND_RESP);
             };
             let mut json = Vec::with_capacity(256);
             format_pr_json(&mut json, pr);
-            return write_json_resp(stream, write_buf, 200, b"", &json);
+            return write_json_resp(write_buf, 200, b"", &json);
         }
     }
 
-    write_preframed(stream, NOT_FOUND_RESP)
+    HttpResponse::Static(NOT_FOUND_RESP)
 }
 
 #[inline]
 fn fast_get_issue(
-    stream: &mut TcpStream,
     store: &Store,
     owner: &str,
     repo_name: &str,
     num: u32,
-) -> io::Result<()> {
-    let Some((_owner_login, repo_arc)) = store.get_repo(owner, repo_name) else {
-        return write_preframed(stream, NOT_FOUND_RESP);
+) -> HttpResponse {
+    let Some(repo_arc) = store.get_repo_arc(owner, repo_name) else {
+        return HttpResponse::Static(NOT_FOUND_RESP);
     };
-    get_issue_arc(stream, &repo_arc, num)
+    get_issue_arc(&repo_arc, num)
 }
 
 #[inline]
 fn get_issue_arc(
-    stream: &mut TcpStream,
     repo_arc: &std::sync::RwLock<Repo>,
     num: u32,
-) -> io::Result<()> {
+) -> HttpResponse {
     let Some(idx) = num.checked_sub(1).map(|i| i as usize) else {
-        return write_preframed(stream, NOT_FOUND_RESP);
+        return HttpResponse::Static(NOT_FOUND_RESP);
     };
-    {
+    let cached_opt = {
         let repo = repo_arc.read().unwrap();
         if idx >= repo.issues.len() {
-            return write_preframed(stream, NOT_FOUND_RESP);
+            return HttpResponse::Static(NOT_FOUND_RESP);
         }
-        if let Some(Some(cached)) = repo.issue_http_cache.get(idx) {
-            return write_preframed(stream, cached);
-        }
+        repo.issue_http_cache
+            .get(idx)
+            .and_then(|o| o.as_ref().map(Arc::clone))
+    };
+    if let Some(cached) = cached_opt {
+        return HttpResponse::Shared(cached);
     }
     let frame = {
         let mut repo = repo_arc.write().unwrap();
         repo.get_or_build_issue_http(num)
     };
     match frame {
-        Some(f) => write_preframed(stream, &f),
-        None => write_preframed(stream, NOT_FOUND_RESP),
+        Some(f) => HttpResponse::Shared(f),
+        None => HttpResponse::Static(NOT_FOUND_RESP),
     }
 }
 
 #[inline]
 fn fast_create_issue(
-    stream: &mut TcpStream,
     write_buf: &mut Vec<u8>,
     store: &Store,
     owner: &str,
     repo_name: &str,
     body: &[u8],
-) -> io::Result<()> {
-    let Some((_owner_login, repo_arc)) = store.get_repo(owner, repo_name) else {
-        return write_preframed(stream, NOT_FOUND_RESP);
+) -> HttpResponse {
+    let Some(repo_arc) = store.get_repo_arc(owner, repo_name) else {
+        return HttpResponse::Static(NOT_FOUND_RESP);
     };
-    fast_create_issue_arc(stream, write_buf, store, &repo_arc, body)
+    fast_create_issue_arc(write_buf, store, &repo_arc, body)
 }
 
 #[inline]
 fn fast_create_issue_arc(
-    stream: &mut TcpStream,
     write_buf: &mut Vec<u8>,
     store: &Store,
     repo_arc: &std::sync::RwLock<Repo>,
     body: &[u8],
-) -> io::Result<()> {
+) -> HttpResponse {
     let Ok(input) = parse_fast_issue_body(body) else {
-        return write_preframed(stream, BAD_JSON_RESP);
+        return HttpResponse::Static(BAD_JSON_RESP);
     };
     let mut repo = repo_arc.write().unwrap();
     if let Some(ref lbls) = input.labels {
@@ -384,7 +383,6 @@ fn fast_create_issue_arc(
             if !repo.labels.contains_key(l) {
                 drop(repo);
                 return write_json_message(
-                    stream,
                     write_buf,
                     422,
                     "Validation Failed: label does not exist",
@@ -406,28 +404,30 @@ fn fast_create_issue_arc(
         seq: id,
     };
 
-    let mut json_buf = Vec::with_capacity(256);
-    format_issue_json(&mut json_buf, &issue);
-    repo.issues.push(issue);
-    repo.issue_http_cache.push(None);
-    drop(repo);
+    ISSUE_JSON_BUF.with(|cell| {
+        let mut json_buf = cell.borrow_mut();
+        json_buf.clear();
+        format_issue_json(&mut json_buf, &issue);
+        repo.issues.push(issue);
+        repo.issue_http_cache.push(None);
+        drop(repo);
 
-    write_buf.clear();
-    write_buf
-        .extend_from_slice(b"HTTP/1.1 201 Created\r\nContent-Type: application/json\r\nX-GitHub-Request-Id: 1\r\nContent-Length: ");
-    write_u64_ascii(write_buf, json_buf.len() as u64);
-    write_buf.extend_from_slice(b"\r\n\r\n");
-    write_buf.extend_from_slice(&json_buf);
-    stream.write_all(write_buf)
+        write_buf.clear();
+        write_buf
+            .extend_from_slice(b"HTTP/1.1 201 Created\r\nContent-Type: application/json\r\nX-GitHub-Request-Id: 1\r\nContent-Length: ");
+        write_u64_ascii(write_buf, json_buf.len() as u64);
+        write_buf.extend_from_slice(b"\r\n\r\n");
+        write_buf.extend_from_slice(&json_buf);
+        HttpResponse::Owned
+    })
 }
 
 fn list_user_repos(
-    stream: &mut TcpStream,
     write_buf: &mut Vec<u8>,
     store: &Store,
     query: &[u8],
     host: Option<&[u8]>,
-) -> io::Result<()> {
+) -> HttpResponse {
     let per_page = parse_query_param(query, b"per_page")
         .and_then(|s| s.parse::<usize>().ok())
         .unwrap_or(30)
@@ -469,20 +469,15 @@ fn list_user_repos(
         String::new()
     };
 
-    write_json_resp(stream, write_buf, 200, extra.as_bytes(), &json)
+    write_json_resp(write_buf, 200, extra.as_bytes(), &json)
 }
 
-fn create_user_repo(
-    stream: &mut TcpStream,
-    write_buf: &mut Vec<u8>,
-    store: &Store,
-    body: &[u8],
-) -> io::Result<()> {
+fn create_user_repo(write_buf: &mut Vec<u8>, store: &Store, body: &[u8]) -> HttpResponse {
     let Ok(val) = serde_json::from_slice::<serde_json::Value>(body) else {
-        return write_preframed(stream, BAD_JSON_RESP);
+        return HttpResponse::Static(BAD_JSON_RESP);
     };
     let Some(obj) = val.as_object() else {
-        return write_preframed(stream, BAD_JSON_RESP);
+        return HttpResponse::Static(BAD_JSON_RESP);
     };
     let name = obj
         .get("name")
@@ -491,7 +486,7 @@ fn create_user_repo(
         .trim()
         .to_owned();
     if name.is_empty() {
-        return write_json_message(stream, write_buf, 422, "Repository name is required");
+        return write_json_message(write_buf, 422, "Repository name is required");
     }
     let private = obj.get("private").and_then(|v| v.as_bool()).unwrap_or(false);
     let description = obj
@@ -501,41 +496,40 @@ fn create_user_repo(
         .to_owned();
 
     let Ok((owner_login, repo_arc)) = store.create_repo(name, private, description) else {
-        return write_json_message(stream, write_buf, 422, "Repository already exists");
+        return write_json_message(write_buf, 422, "Repository already exists");
     };
     let repo = repo_arc.read().unwrap();
     let mut json = Vec::with_capacity(256);
     format_repo_json(&mut json, &owner_login, &repo);
-    write_json_resp(stream, write_buf, 201, b"", &json)
+    write_json_resp(write_buf, 201, b"", &json)
 }
 
 fn create_git_ref(
-    stream: &mut TcpStream,
     write_buf: &mut Vec<u8>,
     repo_arc: &std::sync::RwLock<Repo>,
     body: &[u8],
-) -> io::Result<()> {
+) -> HttpResponse {
     let Ok(val) = serde_json::from_slice::<serde_json::Value>(body) else {
-        return write_preframed(stream, BAD_JSON_RESP);
+        return HttpResponse::Static(BAD_JSON_RESP);
     };
     let Some(obj) = val.as_object() else {
-        return write_preframed(stream, BAD_JSON_RESP);
+        return HttpResponse::Static(BAD_JSON_RESP);
     };
     let Some(ref_name) = obj.get("ref").and_then(|v| v.as_str()) else {
-        return write_json_message(stream, write_buf, 422, "Missing ref");
+        return write_json_message(write_buf, 422, "Missing ref");
     };
     let Some(sha_str) = obj.get("sha").and_then(|v| v.as_str()) else {
-        return write_json_message(stream, write_buf, 422, "Missing sha");
+        return write_json_message(write_buf, 422, "Missing sha");
     };
     let Some(oid) = hex_to_oid(sha_str.as_bytes()) else {
-        return write_json_message(stream, write_buf, 422, "Invalid sha");
+        return write_json_message(write_buf, 422, "Invalid sha");
     };
     let mut repo = repo_arc.write().unwrap();
     if !repo.objects.contains_key(&oid) {
-        return write_json_message(stream, write_buf, 422, "Object does not exist");
+        return write_json_message(write_buf, 422, "Object does not exist");
     }
     if repo.refs.contains_key(ref_name) {
-        return write_json_message(stream, write_buf, 422, "Reference already exists");
+        return write_json_message(write_buf, 422, "Reference already exists");
     }
     repo.refs.insert(ref_name.to_owned(), oid);
     repo.invalidate_git_caches();
@@ -546,21 +540,20 @@ fn create_git_ref(
     json.extend_from_slice(b",\"object\":{\"sha\":\"");
     write_oid_hex(&oid, &mut json);
     json.extend_from_slice(b"\",\"type\":\"commit\"}}");
-    write_json_resp(stream, write_buf, 201, b"", &json)
+    write_json_resp(write_buf, 201, b"", &json)
 }
 
 fn list_commits(
-    stream: &mut TcpStream,
     write_buf: &mut Vec<u8>,
     repo_arc: &std::sync::RwLock<Repo>,
     query: &[u8],
-) -> io::Result<()> {
+) -> HttpResponse {
     let sha_param = parse_query_param(query, b"sha");
     let repo = repo_arc.read().unwrap();
     let start_oid = match sha_param {
         Some(ref spec) if !spec.is_empty() => match repo.resolve_ref_oid(spec) {
             Some(oid) => oid,
-            None => return write_preframed(stream, NOT_FOUND_RESP),
+            None => return HttpResponse::Static(NOT_FOUND_RESP),
         },
         _ => match repo
             .refs
@@ -569,7 +562,7 @@ fn list_commits(
         {
             Some(oid) => oid,
             None => {
-                return write_json_resp(stream, write_buf, 200, b"", b"[]");
+                return write_json_resp(write_buf, 200, b"", b"[]");
             }
         },
     };
@@ -614,24 +607,23 @@ fn list_commits(
         }
     }
     json.push(b']');
-    write_json_resp(stream, write_buf, 200, b"", &json)
+    write_json_resp(write_buf, 200, b"", &json)
 }
 
 fn get_contents(
-    stream: &mut TcpStream,
     write_buf: &mut Vec<u8>,
     repo_arc: &std::sync::RwLock<Repo>,
     file_path: &str,
     query: &[u8],
-) -> io::Result<()> {
+) -> HttpResponse {
     let ref_param = parse_query_param(query, b"ref");
     let repo = repo_arc.read().unwrap();
     let ref_name = ref_param.as_deref().unwrap_or(&repo.default_branch);
     let Some(commit_oid) = repo.resolve_ref_oid(ref_name) else {
-        return write_preframed(stream, NOT_FOUND_RESP);
+        return HttpResponse::Static(NOT_FOUND_RESP);
     };
     let Some(&tree_oid) = repo.commit_trees.get(&commit_oid) else {
-        return write_preframed(stream, NOT_FOUND_RESP);
+        return HttpResponse::Static(NOT_FOUND_RESP);
     };
     let clean_path = file_path.trim_matches('/');
     let segments: Vec<&str> = if clean_path.is_empty() {
@@ -640,12 +632,12 @@ fn get_contents(
         clean_path.split('/').filter(|s| !s.is_empty()).collect()
     };
     let Some((mode, oid)) = repo.find_tree_entry_at_path(tree_oid, &segments) else {
-        return write_preframed(stream, NOT_FOUND_RESP);
+        return HttpResponse::Static(NOT_FOUND_RESP);
     };
 
     if mode == "40000" {
         let Some(tree_obj) = repo.objects.get(&oid) else {
-            return write_preframed(stream, NOT_FOUND_RESP);
+            return HttpResponse::Static(NOT_FOUND_RESP);
         };
         let entries = parse_tree(&tree_obj.data);
         let mut json = Vec::with_capacity(entries.len() * 96 + 8);
@@ -678,10 +670,10 @@ fn get_contents(
             json.push(b'}');
         }
         json.push(b']');
-        write_json_resp(stream, write_buf, 200, b"", &json)
+        write_json_resp(write_buf, 200, b"", &json)
     } else {
         let Some(blob_obj) = repo.objects.get(&oid) else {
-            return write_preframed(stream, NOT_FOUND_RESP);
+            return HttpResponse::Static(NOT_FOUND_RESP);
         };
         let b64 = b64_encode(&blob_obj.data);
         let name = segments.last().copied().unwrap_or("");
@@ -697,44 +689,43 @@ fn get_contents(
         json.extend_from_slice(b",\"path\":");
         write_json_str(&mut json, clean_path);
         json.push(b'}');
-        write_json_resp(stream, write_buf, 200, b"", &json)
+        write_json_resp(write_buf, 200, b"", &json)
     }
 }
 
 fn put_contents(
-    stream: &mut TcpStream,
     write_buf: &mut Vec<u8>,
     store: &Store,
     owner_login: &str,
     repo_arc: &std::sync::RwLock<Repo>,
     file_path: &str,
     body: &[u8],
-) -> io::Result<()> {
+) -> HttpResponse {
     let clean_path = file_path.trim_matches('/');
     if clean_path.is_empty() {
-        return write_json_message(stream, write_buf, 422, "Invalid path");
+        return write_json_message(write_buf, 422, "Invalid path");
     }
     let Ok(val) = serde_json::from_slice::<serde_json::Value>(body) else {
-        return write_preframed(stream, BAD_JSON_RESP);
+        return HttpResponse::Static(BAD_JSON_RESP);
     };
     let Some(obj) = val.as_object() else {
-        return write_preframed(stream, BAD_JSON_RESP);
+        return HttpResponse::Static(BAD_JSON_RESP);
     };
     let message = obj
         .get("message")
         .and_then(|v| v.as_str())
         .unwrap_or("update file");
     let Some(content_b64) = obj.get("content").and_then(|v| v.as_str()) else {
-        return write_json_message(stream, write_buf, 422, "Missing content");
+        return write_json_message(write_buf, 422, "Missing content");
     };
     let Some(raw_bytes) = b64_decode(content_b64.as_bytes()) else {
-        return write_json_message(stream, write_buf, 422, "Invalid base64 content");
+        return write_json_message(write_buf, 422, "Invalid base64 content");
     };
     let provided_sha = match obj.get("sha") {
         None | Some(serde_json::Value::Null) => None,
         Some(v) => match v.as_str().and_then(|s| hex_to_oid(s.as_bytes())) {
             Some(oid) => Some(oid),
-            None => return write_json_message(stream, write_buf, 409, "Invalid sha"),
+            None => return write_json_message(write_buf, 409, "Invalid sha"),
         },
     };
 
@@ -763,13 +754,13 @@ fn put_contents(
     let status = match existing_oid {
         Some(cur_oid) => {
             if provided_sha != Some(cur_oid) {
-                return write_json_message(stream, write_buf, 409, "sha does not match");
+                return write_json_message(write_buf, 409, "sha does not match");
             }
             200
         }
         None => {
             if provided_sha.is_some() {
-                return write_json_message(stream, write_buf, 409, "sha does not match");
+                return write_json_message(write_buf, 409, "sha does not match");
             }
             201
         }
@@ -809,24 +800,23 @@ fn put_contents(
     json.extend_from_slice(b",\"encoding\":\"base64\"},\"commit\":{\"sha\":\"");
     write_oid_hex(&commit_oid, &mut json);
     json.extend_from_slice(b"\"}}");
-    write_json_resp(stream, write_buf, status, b"", &json)
+    write_json_resp(write_buf, status, b"", &json)
 }
 
 fn delete_contents(
-    stream: &mut TcpStream,
     write_buf: &mut Vec<u8>,
     store: &Store,
     owner_login: &str,
     repo_arc: &std::sync::RwLock<Repo>,
     file_path: &str,
     body: &[u8],
-) -> io::Result<()> {
+) -> HttpResponse {
     let clean_path = file_path.trim_matches('/');
     let Ok(val) = serde_json::from_slice::<serde_json::Value>(body) else {
-        return write_preframed(stream, BAD_JSON_RESP);
+        return HttpResponse::Static(BAD_JSON_RESP);
     };
     let Some(obj) = val.as_object() else {
-        return write_preframed(stream, BAD_JSON_RESP);
+        return HttpResponse::Static(BAD_JSON_RESP);
     };
     let message = obj
         .get("message")
@@ -846,15 +836,15 @@ fn delete_contents(
         .to_owned();
     let full_ref = format!("refs/heads/{}", branch);
     let Some(parent_tip) = repo.refs.get(&full_ref).copied() else {
-        return write_preframed(stream, NOT_FOUND_RESP);
+        return HttpResponse::Static(NOT_FOUND_RESP);
     };
 
     let mut files = repo.flatten_commit_tree(parent_tip);
     let Some((_, cur_oid)) = files.get(clean_path).cloned() else {
-        return write_preframed(stream, NOT_FOUND_RESP);
+        return HttpResponse::Static(NOT_FOUND_RESP);
     };
     if provided_sha != Some(cur_oid) {
-        return write_json_message(stream, write_buf, 409, "sha does not match");
+        return write_json_message(write_buf, 409, "sha does not match");
     }
 
     files.remove(clean_path);
@@ -875,20 +865,19 @@ fn delete_contents(
     json.extend_from_slice(b"{\"commit\":{\"sha\":\"");
     write_oid_hex(&commit_oid, &mut json);
     json.extend_from_slice(b"\"}}");
-    write_json_resp(stream, write_buf, 200, b"", &json)
+    write_json_resp(write_buf, 200, b"", &json)
 }
 
 fn create_label(
-    stream: &mut TcpStream,
     write_buf: &mut Vec<u8>,
     repo_arc: &std::sync::RwLock<Repo>,
     body: &[u8],
-) -> io::Result<()> {
+) -> HttpResponse {
     let Ok(val) = serde_json::from_slice::<serde_json::Value>(body) else {
-        return write_preframed(stream, BAD_JSON_RESP);
+        return HttpResponse::Static(BAD_JSON_RESP);
     };
     let Some(obj) = val.as_object() else {
-        return write_preframed(stream, BAD_JSON_RESP);
+        return HttpResponse::Static(BAD_JSON_RESP);
     };
     let name = obj
         .get("name")
@@ -896,7 +885,7 @@ fn create_label(
         .unwrap_or("")
         .to_owned();
     if name.is_empty() {
-        return write_json_message(stream, write_buf, 422, "Label name is required");
+        return write_json_message(write_buf, 422, "Label name is required");
     }
     let color = obj
         .get("color")
@@ -913,15 +902,14 @@ fn create_label(
     json.extend_from_slice(b",\"color\":");
     write_json_str(&mut json, &color);
     json.push(b'}');
-    write_json_resp(stream, write_buf, 201, b"", &json)
+    write_json_resp(write_buf, 201, b"", &json)
 }
 
 fn list_issues(
-    stream: &mut TcpStream,
     write_buf: &mut Vec<u8>,
     repo_arc: &std::sync::RwLock<Repo>,
     query: &[u8],
-) -> io::Result<()> {
+) -> HttpResponse {
     let state_param = parse_query_param(query, b"state");
     let dir_param = parse_query_param(query, b"direction");
     let per_page = parse_query_param(query, b"per_page")
@@ -967,39 +955,37 @@ fn list_issues(
         }
     }
     json.push(b']');
-    write_json_resp(stream, write_buf, 200, b"", &json)
+    write_json_resp(write_buf, 200, b"", &json)
 }
 
 fn patch_issue(
-    stream: &mut TcpStream,
     write_buf: &mut Vec<u8>,
     repo_arc: &std::sync::RwLock<Repo>,
     num: u32,
     body: &[u8],
-) -> io::Result<()> {
+) -> HttpResponse {
     let Ok(val) = serde_json::from_slice::<serde_json::Value>(body) else {
-        return write_preframed(stream, BAD_JSON_RESP);
+        return HttpResponse::Static(BAD_JSON_RESP);
     };
     let Some(obj) = val.as_object() else {
-        return write_preframed(stream, BAD_JSON_RESP);
+        return HttpResponse::Static(BAD_JSON_RESP);
     };
 
     let mut repo = repo_arc.write().unwrap();
     let Some(idx) = num.checked_sub(1).map(|i| i as usize) else {
-        return write_preframed(stream, NOT_FOUND_RESP);
+        return HttpResponse::Static(NOT_FOUND_RESP);
     };
     if idx >= repo.issues.len() {
-        return write_preframed(stream, NOT_FOUND_RESP);
+        return HttpResponse::Static(NOT_FOUND_RESP);
     }
 
     if let Some(lbls) = obj.get("labels").and_then(|v| v.as_array()) {
         for item in lbls {
             let Some(name) = item.as_str() else {
-                return write_json_message(stream, write_buf, 422, "Invalid label");
+                return write_json_message(write_buf, 422, "Invalid label");
             };
             if !repo.labels.contains_key(name) {
                 return write_json_message(
-                    stream,
                     write_buf,
                     422,
                     "Validation Failed: label does not exist",
@@ -1019,7 +1005,7 @@ fn patch_issue(
         match s {
             "open" => issue.state = IssueState::Open,
             "closed" => issue.state = IssueState::Closed,
-            _ => return write_json_message(stream, write_buf, 422, "Invalid state"),
+            _ => return write_json_message(write_buf, 422, "Invalid state"),
         }
     }
     if let Some(lbls) = obj.get("labels").and_then(|v| v.as_array()) {
@@ -1032,22 +1018,21 @@ fn patch_issue(
     let mut json = Vec::with_capacity(256);
     format_issue_json(&mut json, issue);
     repo.invalidate_issue_cache(num);
-    write_json_resp(stream, write_buf, 200, b"", &json)
+    write_json_resp(write_buf, 200, b"", &json)
 }
 
 fn create_comment(
-    stream: &mut TcpStream,
     write_buf: &mut Vec<u8>,
     store: &Store,
     repo_arc: &std::sync::RwLock<Repo>,
     num: u32,
     body: &[u8],
-) -> io::Result<()> {
+) -> HttpResponse {
     let Ok(val) = serde_json::from_slice::<serde_json::Value>(body) else {
-        return write_preframed(stream, BAD_JSON_RESP);
+        return HttpResponse::Static(BAD_JSON_RESP);
     };
     let Some(obj) = val.as_object() else {
-        return write_preframed(stream, BAD_JSON_RESP);
+        return HttpResponse::Static(BAD_JSON_RESP);
     };
     let comment_body = obj
         .get("body")
@@ -1057,7 +1042,7 @@ fn create_comment(
 
     let mut repo = repo_arc.write().unwrap();
     let Some(issue) = num.checked_sub(1).and_then(|i| repo.issues.get_mut(i as usize)) else {
-        return write_preframed(stream, NOT_FOUND_RESP);
+        return HttpResponse::Static(NOT_FOUND_RESP);
     };
     let cid = store.next_comment_id.fetch_add(1, Ordering::Relaxed);
     let gid = format!("C_{:x}", cid);
@@ -1075,18 +1060,17 @@ fn create_comment(
     json.extend_from_slice(b"\",\"body\":");
     write_json_str(&mut json, &comment_body);
     json.push(b'}');
-    write_json_resp(stream, write_buf, 201, b"", &json)
+    write_json_resp(write_buf, 201, b"", &json)
 }
 
 fn list_comments(
-    stream: &mut TcpStream,
     write_buf: &mut Vec<u8>,
     repo_arc: &std::sync::RwLock<Repo>,
     num: u32,
-) -> io::Result<()> {
+) -> HttpResponse {
     let repo = repo_arc.read().unwrap();
     let Some(issue) = num.checked_sub(1).and_then(|i| repo.issues.get(i as usize)) else {
-        return write_preframed(stream, NOT_FOUND_RESP);
+        return HttpResponse::Static(NOT_FOUND_RESP);
     };
     let mut json = Vec::with_capacity(256);
     json.push(b'[');
@@ -1103,21 +1087,20 @@ fn list_comments(
         json.push(b'}');
     }
     json.push(b']');
-    write_json_resp(stream, write_buf, 200, b"", &json)
+    write_json_resp(write_buf, 200, b"", &json)
 }
 
 fn create_pull(
-    stream: &mut TcpStream,
     write_buf: &mut Vec<u8>,
     store: &Store,
     repo_arc: &std::sync::RwLock<Repo>,
     body: &[u8],
-) -> io::Result<()> {
+) -> HttpResponse {
     let Ok(val) = serde_json::from_slice::<serde_json::Value>(body) else {
-        return write_preframed(stream, BAD_JSON_RESP);
+        return HttpResponse::Static(BAD_JSON_RESP);
     };
     let Some(obj) = val.as_object() else {
-        return write_preframed(stream, BAD_JSON_RESP);
+        return HttpResponse::Static(BAD_JSON_RESP);
     };
     let title = obj
         .get("title")
@@ -1146,10 +1129,10 @@ fn create_pull(
 
     let mut repo = repo_arc.write().unwrap();
     let Some(head_sha) = repo.refs.get(&format!("refs/heads/{}", head)).copied() else {
-        return write_json_message(stream, write_buf, 422, "Head branch not found");
+        return write_json_message(write_buf, 422, "Head branch not found");
     };
     let Some(base_sha) = repo.refs.get(&format!("refs/heads/{}", base)).copied() else {
-        return write_json_message(stream, write_buf, 422, "Base branch not found");
+        return write_json_message(write_buf, 422, "Base branch not found");
     };
 
     let id = store.next_pr_id.fetch_add(1, Ordering::Relaxed);
@@ -1173,15 +1156,14 @@ fn create_pull(
     let mut json = Vec::with_capacity(256);
     format_pr_json(&mut json, &pr);
     repo.pulls.push(pr);
-    write_json_resp(stream, write_buf, 201, b"", &json)
+    write_json_resp(write_buf, 201, b"", &json)
 }
 
 fn list_pulls(
-    stream: &mut TcpStream,
     write_buf: &mut Vec<u8>,
     repo_arc: &std::sync::RwLock<Repo>,
     query: &[u8],
-) -> io::Result<()> {
+) -> HttpResponse {
     let state_param = parse_query_param(query, b"state");
     let per_page = parse_query_param(query, b"per_page")
         .and_then(|s| s.parse::<usize>().ok())
@@ -1219,18 +1201,17 @@ fn list_pulls(
         }
     }
     json.push(b']');
-    write_json_resp(stream, write_buf, 200, b"", &json)
+    write_json_resp(write_buf, 200, b"", &json)
 }
 
 fn list_pull_files(
-    stream: &mut TcpStream,
     write_buf: &mut Vec<u8>,
     repo_arc: &std::sync::RwLock<Repo>,
     num: u32,
-) -> io::Result<()> {
+) -> HttpResponse {
     let repo = repo_arc.read().unwrap();
     let Some(pr) = num.checked_sub(1).and_then(|i| repo.pulls.get(i as usize)) else {
-        return write_preframed(stream, NOT_FOUND_RESP);
+        return HttpResponse::Static(NOT_FOUND_RESP);
     };
     let files = repo.diff_pr_files(pr);
     let mut json = Vec::with_capacity(files.len() * 96 + 8);
@@ -1252,26 +1233,25 @@ fn list_pull_files(
         json.push(b'}');
     }
     json.push(b']');
-    write_json_resp(stream, write_buf, 200, b"", &json)
+    write_json_resp(write_buf, 200, b"", &json)
 }
 
 fn merge_pull(
-    stream: &mut TcpStream,
     write_buf: &mut Vec<u8>,
     store: &Store,
     owner_login: &str,
     repo_arc: &std::sync::RwLock<Repo>,
     num: u32,
     body: &[u8],
-) -> io::Result<()> {
+) -> HttpResponse {
     let commit_title = if body.iter().all(|b| b.is_ascii_whitespace()) {
         None
     } else {
         let Ok(val) = serde_json::from_slice::<serde_json::Value>(body) else {
-            return write_preframed(stream, BAD_JSON_RESP);
+            return HttpResponse::Static(BAD_JSON_RESP);
         };
         let Some(obj) = val.as_object() else {
-            return write_preframed(stream, BAD_JSON_RESP);
+            return HttpResponse::Static(BAD_JSON_RESP);
         };
         obj.get("commit_title")
             .and_then(|v| v.as_str())
@@ -1287,11 +1267,9 @@ fn merge_pull(
             json.extend_from_slice(
                 b"\",\"merged\":true,\"message\":\"Pull Request successfully merged\"}",
             );
-            write_json_resp(stream, write_buf, 200, b"", &json)
+            write_json_resp(write_buf, 200, b"", &json)
         }
-        Err(MergeError::NotFound) => write_preframed(stream, NOT_FOUND_RESP),
-        Err(MergeError::Conflict) => {
-            write_json_message(stream, write_buf, 405, "Merge conflict")
-        }
+        Err(MergeError::NotFound) => HttpResponse::Static(NOT_FOUND_RESP),
+        Err(MergeError::Conflict) => write_json_message(write_buf, 405, "Merge conflict"),
     }
 }

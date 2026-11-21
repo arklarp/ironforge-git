@@ -1,13 +1,13 @@
 use std::borrow::Cow;
-use std::io::{self, ErrorKind, Read, Write};
-use std::net::TcpStream;
 use std::sync::Arc;
 
 use crate::util::write_u64_ascii;
 
 const MAX_HEADER_BYTES: usize = 64 * 1024;
 const MAX_BODY_BYTES: usize = 32 * 1024 * 1024;
-const INITIAL_READ_CAP: usize = 65536;
+const MAX_BUF_BYTES: usize = MAX_BODY_BYTES + MAX_HEADER_BYTES + 4096;
+pub const INITIAL_CONN_READ_CAP: usize = 4096;
+pub const SHRINK_THRESHOLD: usize = 65536;
 
 pub const HEALTHZ_RESP: &[u8] =
     b"HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nX-GitHub-Request-Id: 1\r\nContent-Length: 11\r\n\r\n{\"ok\":true}";
@@ -19,35 +19,12 @@ pub const BAD_JSON_RESP: &[u8] =
     b"HTTP/1.1 400 Bad Request\r\nContent-Type: application/json\r\nX-GitHub-Request-Id: 1\r\nContent-Length: 26\r\n\r\n{\"message\":\"Invalid JSON\"}";
 pub const NO_CONTENT_RESP: &[u8] =
     b"HTTP/1.1 204 No Content\r\nContent-Type: application/json\r\nX-GitHub-Request-Id: 1\r\nContent-Length: 0\r\n\r\n";
+pub const CONTINUE_100_RESP: &[u8] = b"HTTP/1.1 100 Continue\r\n\r\n";
 
-pub struct ConnBufs {
-    pub read_buf: Vec<u8>,
-    pub read_pos: usize,
-    pub read_len: usize,
-    pub write_buf: Vec<u8>,
-}
-
-impl ConnBufs {
-    pub fn new() -> Self {
-        Self {
-            read_buf: vec![0u8; INITIAL_READ_CAP],
-            read_pos: 0,
-            read_len: 0,
-            write_buf: Vec::with_capacity(65536),
-        }
-    }
-
-    #[inline]
-    pub fn reset_if_empty(&mut self) {
-        if self.read_pos >= self.read_len {
-            self.read_pos = 0;
-            self.read_len = 0;
-            if self.read_buf.len() > 1024 * 1024 {
-                self.read_buf.truncate(INITIAL_READ_CAP);
-                self.read_buf.shrink_to(INITIAL_READ_CAP);
-            }
-        }
-    }
+pub enum HttpResponse {
+    Static(&'static [u8]),
+    Shared(Arc<[u8]>),
+    Owned,
 }
 
 #[derive(Clone, Copy)]
@@ -60,6 +37,92 @@ impl Span {
     #[inline]
     pub fn slice<'a>(&self, buf: &'a [u8]) -> &'a [u8] {
         &buf[self.start..self.end]
+    }
+}
+
+pub struct HeaderMeta {
+    pub method: Span,
+    pub path: Span,
+    pub query: Span,
+    pub authorization: Option<Span>,
+    pub host: Option<Span>,
+    pub git_protocol: Option<Span>,
+    pub body_start: usize,
+    pub content_length: usize,
+    pub chunked: bool,
+    pub expect_100: bool,
+    pub keep_alive: bool,
+    pub sent_100: bool,
+}
+
+pub struct ReadState {
+    pub buf: Vec<u8>,
+    pub pos: usize,
+    pub len: usize,
+    pub header: Option<HeaderMeta>,
+}
+
+impl ReadState {
+    #[inline]
+    pub fn new(buf: Vec<u8>) -> Self {
+        Self {
+            buf,
+            pos: 0,
+            len: 0,
+            header: None,
+        }
+    }
+
+    #[inline]
+    pub fn ensure_space(&mut self) -> bool {
+        if self.len < self.buf.len() {
+            return true;
+        }
+        if self.header.is_none() && self.pos > 0 {
+            if self.pos >= self.len {
+                self.pos = 0;
+                self.len = 0;
+                return true;
+            }
+            let rem = self.len - self.pos;
+            self.buf.copy_within(self.pos..self.len, 0);
+            self.pos = 0;
+            self.len = rem;
+            return true;
+        }
+        if self.len >= MAX_BUF_BYTES {
+            return false;
+        }
+        let new_len = self
+            .buf
+            .len()
+            .saturating_mul(2)
+            .max(self.len + 16384)
+            .min(MAX_BUF_BYTES);
+        if new_len <= self.len {
+            return false;
+        }
+        self.buf.resize(new_len, 0);
+        true
+    }
+
+    #[inline]
+    pub fn advance(&mut self, next_pos: usize) {
+        self.pos = next_pos;
+        self.header = None;
+        if self.pos >= self.len {
+            self.pos = 0;
+            self.len = 0;
+            if self.buf.len() > SHRINK_THRESHOLD {
+                self.buf.truncate(INITIAL_CONN_READ_CAP);
+                self.buf.shrink_to(INITIAL_CONN_READ_CAP);
+            }
+        } else if self.pos > 4096 {
+            let rem = self.len - self.pos;
+            self.buf.copy_within(self.pos..self.len, 0);
+            self.pos = 0;
+            self.len = rem;
+        }
     }
 }
 
@@ -84,6 +147,13 @@ impl ParsedRequest {
             None => &buf[self.body_span.start..self.body_span.end],
         }
     }
+}
+
+pub enum ParseResult {
+    Complete(ParsedRequest),
+    NeedMore,
+    Send100Continue,
+    Error,
 }
 
 #[inline]
@@ -114,11 +184,6 @@ fn trim_ascii(buf: &[u8], mut s: usize, mut e: usize) -> (usize, usize) {
 }
 
 #[inline]
-fn eq_ignore_ascii_case(a: &[u8], b: &[u8]) -> bool {
-    a.eq_ignore_ascii_case(b)
-}
-
-#[inline]
 fn contains_ignore_ascii_case(haystack: &[u8], needle: &[u8]) -> bool {
     if needle.is_empty() {
         return true;
@@ -126,7 +191,9 @@ fn contains_ignore_ascii_case(haystack: &[u8], needle: &[u8]) -> bool {
     if haystack.len() < needle.len() {
         return false;
     }
-    haystack.windows(needle.len()).any(|w| w.eq_ignore_ascii_case(needle))
+    haystack
+        .windows(needle.len())
+        .any(|w| w.eq_ignore_ascii_case(needle))
 }
 
 #[inline]
@@ -144,167 +211,140 @@ fn parse_usize_ascii(bytes: &[u8]) -> Option<usize> {
     Some(val)
 }
 
-fn read_more(stream: &mut TcpStream, bufs: &mut ConnBufs) -> io::Result<usize> {
-    if bufs.read_len == bufs.read_buf.len() {
-        let new_len = bufs.read_buf.len().saturating_mul(2).max(bufs.read_len + 16384);
-        bufs.read_buf.resize(new_len, 0);
-    }
-    match stream.read(&mut bufs.read_buf[bufs.read_len..]) {
-        Ok(n) => {
-            bufs.read_len += n;
-            Ok(n)
+pub fn try_parse_request(rs: &mut ReadState) -> ParseResult {
+    if rs.header.is_none() {
+        if rs.pos >= rs.len {
+            rs.pos = 0;
+            rs.len = 0;
+            return ParseResult::NeedMore;
         }
-        Err(e) => Err(e),
-    }
-}
+        if rs.pos > 4096 {
+            let rem = rs.len - rs.pos;
+            rs.buf.copy_within(rs.pos..rs.len, 0);
+            rs.pos = 0;
+            rs.len = rem;
+        }
 
-pub fn read_http_request(stream: &mut TcpStream, bufs: &mut ConnBufs) -> io::Result<Option<ParsedRequest>> {
-    if bufs.read_pos > 0 {
-        if bufs.read_pos >= bufs.read_len {
-            bufs.read_pos = 0;
-            bufs.read_len = 0;
-        } else if bufs.read_pos > 4096 {
-            let rem = bufs.read_len - bufs.read_pos;
-            bufs.read_buf.copy_within(bufs.read_pos..bufs.read_len, 0);
-            bufs.read_pos = 0;
-            bufs.read_len = rem;
-        }
-    }
-
-    let hdr_end = loop {
-        let avail = &bufs.read_buf[bufs.read_pos..bufs.read_len];
-        if let Some(rel_end) = find_header_end(avail) {
-            break bufs.read_pos + rel_end;
-        }
-        if avail.len() >= MAX_HEADER_BYTES {
-            return Err(io::Error::new(ErrorKind::InvalidData, "headers too large"));
-        }
-        match read_more(stream, bufs) {
-            Ok(0) => return Ok(None),
-            Ok(_) => {}
-            Err(e)
-                if matches!(
-                    e.kind(),
-                    ErrorKind::WouldBlock
-                        | ErrorKind::TimedOut
-                        | ErrorKind::ConnectionReset
-                        | ErrorKind::BrokenPipe
-                        | ErrorKind::UnexpectedEof
-                ) =>
-            {
-                return Ok(None);
+        let avail = &rs.buf[rs.pos..rs.len];
+        let Some(rel_end) = find_header_end(avail) else {
+            if avail.len() >= MAX_HEADER_BYTES {
+                return ParseResult::Error;
             }
-            Err(e) => return Err(e),
+            return ParseResult::NeedMore;
+        };
+        if rel_end >= MAX_HEADER_BYTES {
+            return ParseResult::Error;
         }
-    };
 
-    let base = bufs.read_pos;
-    let body_start = hdr_end + 4;
-    let hdr_bytes = &bufs.read_buf[base..hdr_end];
+        let base = rs.pos;
+        let hdr_end = base + rel_end;
+        let body_start = hdr_end + 4;
+        let hdr_bytes = &rs.buf[base..hdr_end];
 
-    let line_end = hdr_bytes
-        .windows(2)
-        .position(|w| w == b"\r\n")
-        .unwrap_or(hdr_bytes.len());
-    let req_line = &hdr_bytes[..line_end];
-
-    let sp1 = req_line
-        .iter()
-        .position(|&b| b == b' ')
-        .ok_or_else(|| io::Error::new(ErrorKind::InvalidData, "bad request line"))?;
-    let rest_after_method = &req_line[sp1 + 1..];
-    let sp2_rel = rest_after_method
-        .iter()
-        .position(|&b| b == b' ')
-        .ok_or_else(|| io::Error::new(ErrorKind::InvalidData, "bad request target"))?;
-    let target_start = base + sp1 + 1;
-    let target_end = target_start + sp2_rel;
-    let version = &rest_after_method[sp2_rel + 1..];
-    let is_http_11 = version.starts_with(b"HTTP/1.1");
-
-    let target_slice = &bufs.read_buf[target_start..target_end];
-    let (path_span, query_span) = match target_slice.iter().position(|&b| b == b'?') {
-        Some(q) => (
-            Span {
-                start: target_start,
-                end: target_start + q,
-            },
-            Span {
-                start: target_start + q + 1,
-                end: target_end,
-            },
-        ),
-        None => (
-            Span {
-                start: target_start,
-                end: target_end,
-            },
-            Span { start: 0, end: 0 },
-        ),
-    };
-
-    let mut authorization = None;
-    let mut host = None;
-    let mut git_protocol = None;
-    let mut content_length: Option<usize> = None;
-    let mut chunked = false;
-    let mut expect_100 = false;
-    let mut conn_close = false;
-    let mut conn_keep = false;
-
-    let mut cur = line_end + 2;
-    while cur < hdr_bytes.len() {
-        let next_crlf = hdr_bytes[cur..]
+        let line_end = hdr_bytes
             .windows(2)
             .position(|w| w == b"\r\n")
-            .unwrap_or(hdr_bytes.len() - cur);
-        let line = &hdr_bytes[cur..cur + next_crlf];
-        if let Some(colon) = line.iter().position(|&b| b == b':') {
-            let name = &line[..colon];
-            let (vs, ve) = trim_ascii(bufs.read_buf.as_slice(), base + cur + colon + 1, base + cur + next_crlf);
-            let val = &bufs.read_buf[vs..ve];
-            if eq_ignore_ascii_case(name, b"content-length") {
-                content_length = parse_usize_ascii(val);
-            } else if eq_ignore_ascii_case(name, b"authorization") {
-                authorization = Some(Span { start: vs, end: ve });
-            } else if eq_ignore_ascii_case(name, b"host") {
-                host = Some(Span { start: vs, end: ve });
-            } else if eq_ignore_ascii_case(name, b"git-protocol") {
-                git_protocol = Some(Span { start: vs, end: ve });
-            } else if eq_ignore_ascii_case(name, b"transfer-encoding") {
-                if contains_ignore_ascii_case(val, b"chunked") {
-                    chunked = true;
-                }
-            } else if eq_ignore_ascii_case(name, b"connection") {
-                if contains_ignore_ascii_case(val, b"close") {
-                    conn_close = true;
-                } else if contains_ignore_ascii_case(val, b"keep-alive") {
-                    conn_keep = true;
-                }
-            } else if eq_ignore_ascii_case(name, b"expect") {
-                if contains_ignore_ascii_case(val, b"100-continue") {
-                    expect_100 = true;
+            .unwrap_or(hdr_bytes.len());
+        let req_line = &hdr_bytes[..line_end];
+
+        let Some(sp1) = req_line.iter().position(|&b| b == b' ') else {
+            return ParseResult::Error;
+        };
+        let rest_after_method = &req_line[sp1 + 1..];
+        let Some(sp2_rel) = rest_after_method.iter().position(|&b| b == b' ') else {
+            return ParseResult::Error;
+        };
+        let target_start = base + sp1 + 1;
+        let target_end = target_start + sp2_rel;
+        let version = &rest_after_method[sp2_rel + 1..];
+        let is_http_11 = version.starts_with(b"HTTP/1.1");
+
+        let target_slice = &rs.buf[target_start..target_end];
+        let (path_span, query_span) = match target_slice.iter().position(|&b| b == b'?') {
+            Some(q) => (
+                Span {
+                    start: target_start,
+                    end: target_start + q,
+                },
+                Span {
+                    start: target_start + q + 1,
+                    end: target_end,
+                },
+            ),
+            None => (
+                Span {
+                    start: target_start,
+                    end: target_end,
+                },
+                Span { start: 0, end: 0 },
+            ),
+        };
+
+        let mut authorization = None;
+        let mut host = None;
+        let mut git_protocol = None;
+        let mut content_length: Option<usize> = None;
+        let mut chunked = false;
+        let mut expect_100 = false;
+        let mut conn_close = false;
+        let mut conn_keep = false;
+
+        let mut cur = line_end + 2;
+        while cur < hdr_bytes.len() {
+            let next_crlf = hdr_bytes[cur..]
+                .windows(2)
+                .position(|w| w == b"\r\n")
+                .unwrap_or(hdr_bytes.len() - cur);
+            let line = &hdr_bytes[cur..cur + next_crlf];
+            if let Some(colon) = line.iter().position(|&b| b == b':') {
+                let name = &line[..colon];
+                let (vs, ve) = trim_ascii(
+                    rs.buf.as_slice(),
+                    base + cur + colon + 1,
+                    base + cur + next_crlf,
+                );
+                let val = &rs.buf[vs..ve];
+                if name.eq_ignore_ascii_case(b"content-length") {
+                    content_length = parse_usize_ascii(val);
+                } else if name.eq_ignore_ascii_case(b"authorization") {
+                    authorization = Some(Span { start: vs, end: ve });
+                } else if name.eq_ignore_ascii_case(b"host") {
+                    host = Some(Span { start: vs, end: ve });
+                } else if name.eq_ignore_ascii_case(b"git-protocol") {
+                    git_protocol = Some(Span { start: vs, end: ve });
+                } else if name.eq_ignore_ascii_case(b"transfer-encoding") {
+                    if contains_ignore_ascii_case(val, b"chunked") {
+                        chunked = true;
+                    }
+                } else if name.eq_ignore_ascii_case(b"connection") {
+                    if contains_ignore_ascii_case(val, b"close") {
+                        conn_close = true;
+                    } else if contains_ignore_ascii_case(val, b"keep-alive") {
+                        conn_keep = true;
+                    }
+                } else if name.eq_ignore_ascii_case(b"expect") {
+                    if contains_ignore_ascii_case(val, b"100-continue") {
+                        expect_100 = true;
+                    }
                 }
             }
+            cur += next_crlf + 2;
         }
-        cur += next_crlf + 2;
-    }
 
-    let keep_alive = if conn_close {
-        false
-    } else if conn_keep {
-        true
-    } else {
-        is_http_11
-    };
+        let keep_alive = if conn_close {
+            false
+        } else if conn_keep {
+            true
+        } else {
+            is_http_11
+        };
 
-    if expect_100 && ((chunked) || content_length.unwrap_or(0) > 0) {
-        let _ = stream.write_all(b"HTTP/1.1 100 Continue\r\n\r\n");
-    }
+        let cl = content_length.unwrap_or(0);
+        if !chunked && cl > MAX_BODY_BYTES {
+            return ParseResult::Error;
+        }
 
-    if chunked {
-        let (body, next_pos) = read_chunked_body(stream, bufs, body_start)?;
-        return Ok(Some(ParsedRequest {
+        rs.header = Some(HeaderMeta {
             method: Span {
                 start: base,
                 end: base + sp1,
@@ -314,118 +354,144 @@ pub fn read_http_request(stream: &mut TcpStream, bufs: &mut ConnBufs) -> io::Res
             authorization,
             host,
             git_protocol,
-            body_span: Span { start: 0, end: 0 },
-            chunked_body: Some(body),
-            next_pos,
+            body_start,
+            content_length: cl,
+            chunked,
+            expect_100,
             keep_alive,
-        }));
+            sent_100: false,
+        });
     }
 
-    let cl = content_length.unwrap_or(0);
-    if cl > MAX_BODY_BYTES {
-        return Err(io::Error::new(ErrorKind::InvalidData, "body too large"));
-    }
-    let body_end = body_start + cl;
-    if bufs.read_buf.len() < body_end {
-        bufs.read_buf.resize(body_end, 0);
-    }
-    while bufs.read_len < body_end {
-        match read_more(stream, bufs) {
-            Ok(0) => return Ok(None),
-            Ok(_) => {}
-            Err(e) if matches!(e.kind(), ErrorKind::WouldBlock | ErrorKind::TimedOut) => {
-                return Ok(None);
+    let meta = rs.header.as_mut().unwrap();
+    if !meta.chunked {
+        let body_end = meta.body_start + meta.content_length;
+        if rs.len < body_end {
+            if meta.expect_100 && !meta.sent_100 && meta.content_length > 0 {
+                meta.sent_100 = true;
+                return ParseResult::Send100Continue;
             }
-            Err(e) => return Err(e),
+            let target = body_end.min(rs.len + 2 * 1024 * 1024);
+            if rs.buf.len() < target {
+                rs.buf.resize(target, 0);
+            }
+            return ParseResult::NeedMore;
         }
+        let meta = rs.header.take().unwrap();
+        return ParseResult::Complete(ParsedRequest {
+            method: meta.method,
+            path: meta.path,
+            query: meta.query,
+            authorization: meta.authorization,
+            host: meta.host,
+            git_protocol: meta.git_protocol,
+            body_span: Span {
+                start: meta.body_start,
+                end: body_end,
+            },
+            chunked_body: None,
+            next_pos: body_end,
+            keep_alive: meta.keep_alive,
+        });
     }
 
-    Ok(Some(ParsedRequest {
-        method: Span {
-            start: base,
-            end: base + sp1,
-        },
-        path: path_span,
-        query: query_span,
-        authorization,
-        host,
-        git_protocol,
-        body_span: Span {
-            start: body_start,
-            end: body_end,
-        },
-        chunked_body: None,
-        next_pos: body_end,
-        keep_alive,
-    }))
+    match try_parse_chunked(&rs.buf[meta.body_start..rs.len]) {
+        ChunkedRes::Complete(body, consumed) => {
+            let meta = rs.header.take().unwrap();
+            ParseResult::Complete(ParsedRequest {
+                method: meta.method,
+                path: meta.path,
+                query: meta.query,
+                authorization: meta.authorization,
+                host: meta.host,
+                git_protocol: meta.git_protocol,
+                body_span: Span { start: 0, end: 0 },
+                chunked_body: Some(body),
+                next_pos: meta.body_start + consumed,
+                keep_alive: meta.keep_alive,
+            })
+        }
+        ChunkedRes::NeedMore => {
+            if meta.expect_100 && !meta.sent_100 {
+                meta.sent_100 = true;
+                return ParseResult::Send100Continue;
+            }
+            ParseResult::NeedMore
+        }
+        ChunkedRes::Error => ParseResult::Error,
+    }
 }
 
-fn read_chunked_body(
-    stream: &mut TcpStream,
-    bufs: &mut ConnBufs,
-    mut cursor: usize,
-) -> io::Result<(Vec<u8>, usize)> {
-    let mut out = Vec::new();
-    loop {
-        let crlf_pos = loop {
-            if let Some(pos) = bufs.read_buf[cursor..bufs.read_len]
-                .windows(2)
-                .position(|w| w == b"\r\n")
-            {
-                break cursor + pos;
-            }
-            match read_more(stream, bufs) {
-                Ok(0) => return Err(io::Error::new(ErrorKind::UnexpectedEof, "eof in chunk header")),
-                Ok(_) => {}
-                Err(e) => return Err(e),
-            }
+enum ChunkedRes {
+    Complete(Vec<u8>, usize),
+    NeedMore,
+    Error,
+}
+
+fn try_parse_chunked(data: &[u8]) -> ChunkedRes {
+    // Pass 1: validate framing & compute decoded length without allocating on partial data
+    let mut total_len = 0usize;
+    let mut cursor = 0usize;
+    let consumed = loop {
+        let Some(crlf_rel) = data[cursor..].windows(2).position(|w| w == b"\r\n") else {
+            return ChunkedRes::NeedMore;
         };
-        let size_line = &bufs.read_buf[cursor..crlf_pos];
+        let crlf_pos = cursor + crlf_rel;
+        let size_line = &data[cursor..crlf_pos];
         let hex_part = match size_line.iter().position(|&b| b == b';') {
             Some(semi) => &size_line[..semi],
             None => size_line,
         };
-        let hex_str = std::str::from_utf8(hex_part)
-            .map_err(|_| io::Error::new(ErrorKind::InvalidData, "bad chunk size"))?
-            .trim();
-        let chunk_len = usize::from_str_radix(hex_str, 16)
-            .map_err(|_| io::Error::new(ErrorKind::InvalidData, "bad chunk hex"))?;
+        let Ok(hex_str) = std::str::from_utf8(hex_part) else {
+            return ChunkedRes::Error;
+        };
+        let Ok(chunk_len) = usize::from_str_radix(hex_str.trim(), 16) else {
+            return ChunkedRes::Error;
+        };
         cursor = crlf_pos + 2;
         if chunk_len == 0 {
-            loop {
-                if bufs.read_len >= cursor + 2 && &bufs.read_buf[cursor..cursor + 2] == b"\r\n" {
-                    return Ok((out, cursor + 2));
-                }
-                if let Some(pos) = bufs.read_buf[cursor..bufs.read_len]
-                    .windows(4)
-                    .position(|w| w == b"\r\n\r\n")
-                {
-                    return Ok((out, cursor + pos + 4));
-                }
-                match read_more(stream, bufs) {
-                    Ok(0) => return Ok((out, bufs.read_len)),
-                    Ok(_) => {}
-                    Err(e) => return Err(e),
-                }
+            if data.len() >= cursor + 2 && &data[cursor..cursor + 2] == b"\r\n" {
+                break cursor + 2;
             }
+            if let Some(pos) = data[cursor..].windows(4).position(|w| w == b"\r\n\r\n") {
+                break cursor + pos + 4;
+            }
+            return ChunkedRes::NeedMore;
         }
-        if out.len() + chunk_len > MAX_BODY_BYTES {
-            return Err(io::Error::new(ErrorKind::InvalidData, "chunked body too large"));
+        if total_len.saturating_add(chunk_len) > MAX_BODY_BYTES {
+            return ChunkedRes::Error;
         }
         let need_end = cursor + chunk_len + 2;
-        if bufs.read_buf.len() < need_end {
-            bufs.read_buf.resize(need_end, 0);
+        if data.len() < need_end {
+            return ChunkedRes::NeedMore;
         }
-        while bufs.read_len < need_end {
-            match read_more(stream, bufs) {
-                Ok(0) => return Err(io::Error::new(ErrorKind::UnexpectedEof, "eof in chunk data")),
-                Ok(_) => {}
-                Err(e) => return Err(e),
-            }
+        if &data[cursor + chunk_len..need_end] != b"\r\n" {
+            return ChunkedRes::Error;
         }
-        out.extend_from_slice(&bufs.read_buf[cursor..cursor + chunk_len]);
+        total_len += chunk_len;
         cursor = need_end;
+    };
+
+    // Pass 2: assemble decoded body into a single exact-sized allocation
+    let mut out = Vec::with_capacity(total_len);
+    let mut c = 0usize;
+    while c < consumed {
+        let crlf_rel = data[c..].windows(2).position(|w| w == b"\r\n").unwrap();
+        let size_line = &data[c..c + crlf_rel];
+        let hex_part = match size_line.iter().position(|&b| b == b';') {
+            Some(semi) => &size_line[..semi],
+            None => size_line,
+        };
+        let hex_str = unsafe { std::str::from_utf8_unchecked(hex_part) };
+        let chunk_len = usize::from_str_radix(hex_str.trim(), 16).unwrap();
+        c += crlf_rel + 2;
+        if chunk_len == 0 {
+            break;
+        }
+        out.extend_from_slice(&data[c..c + chunk_len]);
+        c += chunk_len + 2;
     }
+    ChunkedRes::Complete(out, consumed)
 }
 
 #[inline]
@@ -459,13 +525,12 @@ pub fn build_preframed_http(status: u16, content_type: &[u8], body: &[u8]) -> Ar
 
 #[inline]
 pub fn write_raw_resp(
-    stream: &mut TcpStream,
     write_buf: &mut Vec<u8>,
     status: u16,
     content_type: &[u8],
     extra_headers: &[u8],
     body: &[u8],
-) -> io::Result<()> {
+) -> HttpResponse {
     write_buf.clear();
     write_buf.extend_from_slice(status_line(status));
     write_buf.extend_from_slice(b"Content-Type: ");
@@ -476,58 +541,26 @@ pub fn write_raw_resp(
     write_u64_ascii(write_buf, body.len() as u64);
     write_buf.extend_from_slice(b"\r\n\r\n");
     write_buf.extend_from_slice(body);
-    stream.write_all(write_buf)
+    HttpResponse::Owned
 }
 
 #[inline]
 pub fn write_json_resp(
-    stream: &mut TcpStream,
     write_buf: &mut Vec<u8>,
     status: u16,
     extra_headers: &[u8],
     body: &[u8],
-) -> io::Result<()> {
-    write_raw_resp(stream, write_buf, status, b"application/json", extra_headers, body)
+) -> HttpResponse {
+    write_raw_resp(write_buf, status, b"application/json", extra_headers, body)
 }
 
 #[inline]
-pub fn write_json_message(
-    stream: &mut TcpStream,
-    write_buf: &mut Vec<u8>,
-    status: u16,
-    msg: &str,
-) -> io::Result<()> {
+pub fn write_json_message(write_buf: &mut Vec<u8>, status: u16, msg: &str) -> HttpResponse {
     let mut body = Vec::with_capacity(msg.len() + 16);
     body.extend_from_slice(b"{\"message\":");
     crate::util::write_json_str(&mut body, msg);
     body.push(b'}');
-    write_json_resp(stream, write_buf, status, b"", &body)
-}
-
-#[inline]
-pub fn write_preframed(stream: &mut TcpStream, frame: &[u8]) -> io::Result<()> {
-    stream.write_all(frame)
-}
-
-#[inline]
-pub fn write_preframed_opt_close(
-    stream: &mut TcpStream,
-    write_buf: &mut Vec<u8>,
-    frame: &[u8],
-    force_close: bool,
-) -> io::Result<()> {
-    if !force_close {
-        return stream.write_all(frame);
-    }
-    write_buf.clear();
-    if let Some(pos) = frame.windows(2).position(|w| w == b"\r\n") {
-        write_buf.extend_from_slice(&frame[..pos + 2]);
-        write_buf.extend_from_slice(b"Connection: close\r\n");
-        write_buf.extend_from_slice(&frame[pos + 2..]);
-    } else {
-        write_buf.extend_from_slice(frame);
-    }
-    stream.write_all(write_buf)
+    write_json_resp(write_buf, status, b"", &body)
 }
 
 pub fn host_str<'a>(host_hdr: Option<&'a [u8]>) -> Cow<'a, str> {

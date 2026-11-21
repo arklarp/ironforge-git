@@ -1,47 +1,44 @@
-use std::io;
-use std::net::TcpStream;
 use std::sync::atomic::Ordering;
 
 use rustc_hash::FxHashMap;
 use serde_json::{json, Map, Value};
 
-use crate::http::{write_json_resp, write_preframed, BAD_JSON_RESP, UNAUTH_RESP};
+use crate::http::{write_json_resp, HttpResponse, BAD_JSON_RESP, UNAUTH_RESP};
 use crate::store::{Comment, IssueState, MergeError, PullRequest, Store};
 use crate::util::oid_hex_string;
 
 pub fn handle_graphql(
-    stream: &mut TcpStream,
     write_buf: &mut Vec<u8>,
     store: &Store,
     auth: Option<&[u8]>,
     body: &[u8],
-) -> io::Result<()> {
+) -> HttpResponse {
     if !store.check_auth(auth) {
-        return write_preframed(stream, UNAUTH_RESP);
+        return HttpResponse::Static(UNAUTH_RESP);
     }
 
     let Ok(parsed) = serde_json::from_slice::<Value>(body) else {
-        return write_preframed(stream, BAD_JSON_RESP);
+        return HttpResponse::Static(BAD_JSON_RESP);
     };
 
     if let Some(arr) = parsed.as_array() {
         let mut results = Vec::with_capacity(arr.len());
         for item in arr {
             let Some(obj) = item.as_object() else {
-                return write_preframed(stream, BAD_JSON_RESP);
+                return HttpResponse::Static(BAD_JSON_RESP);
             };
             results.push(exec_one_request(store, obj));
         }
         let resp_bytes = serde_json::to_vec(&results).unwrap_or_else(|_| b"[]".to_vec());
-        return write_json_resp(stream, write_buf, 200, b"", &resp_bytes);
+        return write_json_resp(write_buf, 200, b"", &resp_bytes);
     }
 
     let Some(obj) = parsed.as_object() else {
-        return write_preframed(stream, BAD_JSON_RESP);
+        return HttpResponse::Static(BAD_JSON_RESP);
     };
     let result = exec_one_request(store, obj);
     let resp_bytes = serde_json::to_vec(&result).unwrap_or_else(|_| b"{}".to_vec());
-    write_json_resp(stream, write_buf, 200, b"", &resp_bytes)
+    write_json_resp(write_buf, 200, b"", &resp_bytes)
 }
 
 fn exec_one_request(store: &Store, obj: &Map<String, Value>) -> Value {

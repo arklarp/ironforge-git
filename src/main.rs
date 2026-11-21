@@ -6,22 +6,119 @@ mod rest;
 mod store;
 mod util;
 
-use std::io::{Read, Write};
+use std::io::{self, Read, Write};
 use std::net::{TcpListener, TcpStream};
-use std::os::fd::AsRawFd;
-use std::sync::atomic::{AtomicUsize, Ordering};
-use std::sync::Arc;
+use std::os::fd::{AsRawFd, RawFd};
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use crate::http::{
-    read_http_request, write_preframed, ConnBufs, HEALTHZ_RESP, NOT_FOUND_RESP,
+    try_parse_request, HttpResponse, ParseResult, ParsedRequest, ReadState, CONTINUE_100_RESP,
+    HEALTHZ_RESP, INITIAL_CONN_READ_CAP, NOT_FOUND_RESP, SHRINK_THRESHOLD,
 };
 use crate::store::Store;
 
-const BASE_WORKERS: usize = 2;
-const MAX_WORKERS: usize = 64;
+const NUM_WORKERS: usize = 2;
+const WAKEUP_TOKEN: u64 = u64::MAX;
+const MAX_FREE_BUFS: usize = 64;
+
+struct WorkerInbox {
+    wakeup_fd: RawFd,
+    notified: AtomicBool,
+    fds: Mutex<Vec<RawFd>>,
+}
+
+enum PendingWrite {
+    Static { data: &'static [u8], pos: usize },
+    Shared { data: Arc<[u8]>, pos: usize },
+    Owned { data: Vec<u8>, pos: usize },
+}
+
+impl PendingWrite {
+    #[inline]
+    fn slice(&self) -> &[u8] {
+        match self {
+            PendingWrite::Static { data, pos } => &data[*pos..],
+            PendingWrite::Shared { data, pos } => &data[*pos..],
+            PendingWrite::Owned { data, pos } => &data[*pos..],
+        }
+    }
+
+    #[inline]
+    fn advance(&mut self, n: usize) {
+        match self {
+            PendingWrite::Static { pos, .. }
+            | PendingWrite::Shared { pos, .. }
+            | PendingWrite::Owned { pos, .. } => *pos += n,
+        }
+    }
+}
+
+struct Conn {
+    fd: RawFd,
+    read: ReadState,
+    write_pending: Option<PendingWrite>,
+    write_is_100: bool,
+    close_after_write: bool,
+    want_write: bool,
+    peer_eof: bool,
+}
+
+impl Conn {
+    #[inline]
+    fn new(fd: RawFd, buf: Vec<u8>) -> Self {
+        Self {
+            fd,
+            read: ReadState::new(buf),
+            write_pending: None,
+            write_is_100: false,
+            close_after_write: false,
+            want_write: false,
+            peer_eof: false,
+        }
+    }
+}
+
+enum ConnAction {
+    Keep,
+    WantWrite,
+    StillWrite,
+    WantRead,
+    Close,
+}
+
+enum RecvOut {
+    Bytes(usize),
+    Eof,
+    WouldBlock,
+    Err,
+}
+
+enum SendOut {
+    Done,
+    Partial(usize),
+    Err,
+}
+
+enum FlushRes {
+    Done,
+    Pending,
+    Err,
+}
+
+enum ParseLoopOut {
+    NeedMore { handled_any: bool },
+    Close,
+    WaitWritable,
+    Sent100Now,
+}
 
 fn main() {
+    unsafe {
+        libc::signal(libc::SIGPIPE, libc::SIG_IGN);
+    }
+
     let env_url = match std::env::var("MAKEFUN_ENV_URL") {
         Ok(u) if !u.trim().is_empty() => u.trim_end_matches('/').to_owned(),
         _ => {
@@ -36,135 +133,516 @@ fn main() {
         libc::listen(listener.as_raw_fd(), 512);
     }
     let port = listener.local_addr().expect("local_addr").port();
-
-    let listener = Arc::new(listener);
     let store = Arc::new(Store::new(token));
-    let busy_workers = Arc::new(AtomicUsize::new(0));
-    let total_workers = Arc::new(AtomicUsize::new(BASE_WORKERS));
 
-    for _ in 0..BASE_WORKERS {
-        spawn_worker(
-            Arc::clone(&listener),
-            Arc::clone(&store),
-            Arc::clone(&busy_workers),
-            Arc::clone(&total_workers),
-        );
+    let mut epfds = [0i32; NUM_WORKERS];
+    let mut wakeups = [0i32; NUM_WORKERS];
+    for i in 0..NUM_WORKERS {
+        let epfd = unsafe { libc::epoll_create1(libc::EPOLL_CLOEXEC) };
+        assert!(epfd >= 0, "epoll_create1 failed");
+        let wfd = unsafe { libc::eventfd(0, libc::EFD_NONBLOCK | libc::EFD_CLOEXEC) };
+        assert!(wfd >= 0, "eventfd failed");
+        let mut ev = libc::epoll_event {
+            events: libc::EPOLLIN as u32,
+            u64: WAKEUP_TOKEN,
+        };
+        let rc = unsafe { libc::epoll_ctl(epfd, libc::EPOLL_CTL_ADD, wfd, &mut ev) };
+        assert!(rc == 0, "epoll_ctl add wakeup failed");
+        epfds[i] = epfd;
+        wakeups[i] = wfd;
     }
+
+    let inboxes = Arc::new([
+        WorkerInbox {
+            wakeup_fd: wakeups[0],
+            notified: AtomicBool::new(false),
+            fds: Mutex::new(Vec::with_capacity(64)),
+        },
+        WorkerInbox {
+            wakeup_fd: wakeups[1],
+            notified: AtomicBool::new(false),
+            fds: Mutex::new(Vec::with_capacity(64)),
+        },
+    ]);
+
+    for i in 0..NUM_WORKERS {
+        let epfd = epfds[i];
+        let inboxes_ref = Arc::clone(&inboxes);
+        let store_ref = Arc::clone(&store);
+        let _ = std::thread::Builder::new()
+            .stack_size(512 * 1024)
+            .spawn(move || run_worker(epfd, &inboxes_ref[i], store_ref));
+    }
+
+    let accept_inboxes = Arc::clone(&inboxes);
+    let _ = std::thread::Builder::new()
+        .stack_size(128 * 1024)
+        .spawn(move || run_acceptor(listener, accept_inboxes));
 
     register_port(&env_url, port);
     poll_done(&env_url);
     std::process::exit(0);
 }
 
-fn spawn_worker(
-    listener: Arc<TcpListener>,
-    store: Arc<Store>,
-    busy_workers: Arc<AtomicUsize>,
-    total_workers: Arc<AtomicUsize>,
-) {
-    let _ = std::thread::Builder::new()
-        .stack_size(256 * 1024)
-        .spawn(move || {
-            let mut bufs = ConnBufs::new();
-            loop {
-                let Ok((mut stream, _)) = listener.accept() else {
-                    std::thread::sleep(Duration::from_millis(5));
-                    continue;
-                };
-                let busy = busy_workers.fetch_add(1, Ordering::AcqRel) + 1;
-                let total = total_workers.load(Ordering::Acquire);
-                if busy >= total && total < MAX_WORKERS {
-                    let add = (MAX_WORKERS - total).min(4);
-                    if total_workers
-                        .compare_exchange(total, total + add, Ordering::AcqRel, Ordering::Acquire)
-                        .is_ok()
-                    {
-                        for _ in 0..add {
-                            spawn_worker(
-                                Arc::clone(&listener),
-                                Arc::clone(&store),
-                                Arc::clone(&busy_workers),
-                                Arc::clone(&total_workers),
-                            );
+#[inline]
+fn write_eventfd(fd: RawFd) {
+    let val: u64 = 1;
+    loop {
+        let n = unsafe { libc::write(fd, &val as *const u64 as *const libc::c_void, 8) };
+        if n >= 0 {
+            break;
+        }
+        let err = io::Error::last_os_error().raw_os_error().unwrap_or(0);
+        if err != libc::EINTR {
+            break;
+        }
+    }
+}
+
+#[inline]
+fn drain_eventfd(fd: RawFd) {
+    let mut val: u64 = 0;
+    loop {
+        let n = unsafe { libc::read(fd, &mut val as *mut u64 as *mut libc::c_void, 8) };
+        if n >= 0 {
+            break;
+        }
+        let err = io::Error::last_os_error().raw_os_error().unwrap_or(0);
+        if err == libc::EINTR {
+            continue;
+        }
+        break;
+    }
+}
+
+fn run_acceptor(listener: TcpListener, inboxes: Arc<[WorkerInbox; NUM_WORKERS]>) {
+    let listen_fd = listener.as_raw_fd();
+    let mut rr = 0usize;
+    loop {
+        let fd = unsafe {
+            libc::accept4(
+                listen_fd,
+                std::ptr::null_mut(),
+                std::ptr::null_mut(),
+                libc::SOCK_NONBLOCK | libc::SOCK_CLOEXEC,
+            )
+        };
+        if fd < 0 {
+            let err = io::Error::last_os_error().raw_os_error().unwrap_or(0);
+            if err == libc::EINTR {
+                continue;
+            }
+            if err == libc::EMFILE || err == libc::ENFILE {
+                std::thread::sleep(Duration::from_millis(5));
+            } else {
+                std::thread::sleep(Duration::from_millis(1));
+            }
+            continue;
+        }
+        let inbox = &inboxes[rr & 1];
+        rr = rr.wrapping_add(1);
+        {
+            let mut guard = inbox.fds.lock().unwrap();
+            guard.push(fd);
+        }
+        if !inbox.notified.swap(true, Ordering::SeqCst) {
+            write_eventfd(inbox.wakeup_fd);
+        }
+    }
+}
+
+fn run_worker(epfd: RawFd, inbox: &WorkerInbox, store: Arc<Store>) {
+    let mut conns: Vec<Option<Conn>> = Vec::with_capacity(256);
+    let mut free_bufs: Vec<Vec<u8>> = Vec::with_capacity(MAX_FREE_BUFS);
+    let mut write_buf: Vec<u8> = Vec::with_capacity(65536);
+    let mut local_fds: Vec<RawFd> = Vec::with_capacity(64);
+    let mut events = [libc::epoll_event { events: 0, u64: 0 }; 128];
+
+    loop {
+        let n = unsafe { libc::epoll_wait(epfd, events.as_mut_ptr(), events.len() as i32, -1) };
+        if n < 0 {
+            let err = io::Error::last_os_error().raw_os_error().unwrap_or(0);
+            if err == libc::EINTR {
+                continue;
+            }
+            std::thread::sleep(Duration::from_millis(1));
+            continue;
+        }
+
+        for i in 0..(n as usize) {
+            // epoll_event is repr(packed) on x86_64; copy fields by value.
+            let ev_flags = events[i].events;
+            let token = events[i].u64;
+
+            if token == WAKEUP_TOKEN {
+                drain_eventfd(inbox.wakeup_fd);
+                inbox.notified.store(false, Ordering::SeqCst);
+                {
+                    let mut guard = inbox.fds.lock().unwrap();
+                    std::mem::swap(&mut *guard, &mut local_fds);
+                }
+                for &fd in &local_fds {
+                    if fd < 0 {
+                        continue;
+                    }
+                    let nodelay: libc::c_int = 1;
+                    unsafe {
+                        libc::setsockopt(
+                            fd,
+                            libc::IPPROTO_TCP,
+                            libc::TCP_NODELAY,
+                            &nodelay as *const libc::c_int as *const libc::c_void,
+                            std::mem::size_of::<libc::c_int>() as libc::socklen_t,
+                        );
+                    }
+                    let mut ev = libc::epoll_event {
+                        events: (libc::EPOLLIN | libc::EPOLLRDHUP) as u32,
+                        u64: fd as u64,
+                    };
+                    let rc = unsafe { libc::epoll_ctl(epfd, libc::EPOLL_CTL_ADD, fd, &mut ev) };
+                    if rc < 0 {
+                        unsafe {
+                            libc::close(fd);
+                        }
+                        continue;
+                    }
+                    let idx = fd as usize;
+                    if idx >= conns.len() {
+                        conns.resize_with(idx + 1, || None);
+                    }
+                    let buf = match free_bufs.pop() {
+                        Some(mut b) => {
+                            if b.len() < INITIAL_CONN_READ_CAP {
+                                b.resize(INITIAL_CONN_READ_CAP, 0);
+                            }
+                            b
+                        }
+                        None => vec![0u8; INITIAL_CONN_READ_CAP],
+                    };
+                    conns[idx] = Some(Conn::new(fd, buf));
+                }
+                local_fds.clear();
+                continue;
+            }
+
+            let fd = token as RawFd;
+            let idx = fd as usize;
+            let Some(conn) = conns.get_mut(idx).and_then(Option::as_mut) else {
+                continue;
+            };
+
+            let action = if conn.write_pending.is_some() {
+                if (ev_flags & (libc::EPOLLERR | libc::EPOLLHUP) as u32) != 0 {
+                    ConnAction::Close
+                } else if (ev_flags & libc::EPOLLOUT as u32) != 0 {
+                    on_writable(conn, &mut write_buf, &store)
+                } else {
+                    ConnAction::Keep
+                }
+            } else if (ev_flags & libc::EPOLLERR as u32) != 0
+                || ((ev_flags & libc::EPOLLHUP as u32) != 0
+                    && (ev_flags & libc::EPOLLIN as u32) == 0)
+            {
+                ConnAction::Close
+            } else {
+                on_readable(conn, &mut write_buf, &store)
+            };
+
+            match action {
+                ConnAction::Keep | ConnAction::StillWrite => {}
+                ConnAction::WantWrite => {
+                    if !conn.want_write {
+                        conn.want_write = true;
+                        let mut ev = libc::epoll_event {
+                            events: (libc::EPOLLOUT | libc::EPOLLRDHUP) as u32,
+                            u64: fd as u64,
+                        };
+                        if unsafe { libc::epoll_ctl(epfd, libc::EPOLL_CTL_MOD, fd, &mut ev) } < 0 {
+                            close_conn(&mut conns, &mut free_bufs, fd);
                         }
                     }
                 }
-
-                handle_connection(&mut stream, &mut bufs, &store, &busy_workers);
-                busy_workers.fetch_sub(1, Ordering::AcqRel);
+                ConnAction::WantRead => {
+                    if conn.want_write {
+                        conn.want_write = false;
+                        let mut ev = libc::epoll_event {
+                            events: (libc::EPOLLIN | libc::EPOLLRDHUP) as u32,
+                            u64: fd as u64,
+                        };
+                        if unsafe { libc::epoll_ctl(epfd, libc::EPOLL_CTL_MOD, fd, &mut ev) } < 0 {
+                            close_conn(&mut conns, &mut free_bufs, fd);
+                        }
+                    }
+                }
+                ConnAction::Close => {
+                    close_conn(&mut conns, &mut free_bufs, fd);
+                }
             }
-        });
+        }
+    }
 }
 
-fn handle_connection(
-    stream: &mut TcpStream,
-    bufs: &mut ConnBufs,
-    store: &Store,
-    busy_workers: &AtomicUsize,
-) {
-    let _ = stream.set_nodelay(true);
-    let _ = stream.set_read_timeout(Some(Duration::from_secs(2)));
-    bufs.read_pos = 0;
-    bufs.read_len = 0;
-
-    loop {
-        let req = match read_http_request(stream, bufs) {
-            Ok(Some(r)) => r,
-            Ok(None) | Err(_) => break,
-        };
-
-        let keep_alive = req.keep_alive;
-        let next_pos = req.next_pos;
-        let mut force_close = false;
-
-        let res = {
-            let buf = bufs.read_buf.as_slice();
-            let write_buf = &mut bufs.write_buf;
-            let method = req.method.slice(buf);
-            let path = req.path.slice(buf);
-            let query = req.query.slice(buf);
-            let auth = req.authorization.map(|s| s.slice(buf));
-            let host = req.host.map(|s| s.slice(buf));
-            let git_proto = req.git_protocol.map(|s| s.slice(buf));
-            let body = req.body(buf);
-
-            if method == b"GET" && path == b"/healthz" {
-                write_preframed(stream, HEALTHZ_RESP)
-            } else if path.starts_with(b"/api/v3") {
-                rest::handle_rest(stream, write_buf, store, method, path, query, auth, host, body)
-            } else if path == b"/api/graphql" {
-                graphql::handle_graphql(stream, write_buf, store, auth, body)
-            } else if path == b"/mcp" {
-                mcp::handle_mcp(stream, write_buf, store, method, auth, body)
-            } else if path.contains(&b'.') && path.windows(5).any(|w| w == b".git/") {
-                let busy = busy_workers.load(Ordering::Relaxed);
-                let is_git_upload = path.ends_with(b"/git-upload-pack")
-                    || (path.ends_with(b"/info/refs")
-                        && !query.windows(16).any(|w| w == b"git-receive-pack"));
-                force_close = is_git_upload && busy >= 24;
-                git::handle_git(
-                    stream,
-                    write_buf,
-                    store,
-                    method,
-                    path,
-                    query,
-                    auth,
-                    git_proto,
-                    body,
-                    force_close,
-                )
-            } else {
-                write_preframed(stream, NOT_FOUND_RESP)
+#[inline]
+fn close_conn(conns: &mut [Option<Conn>], free_bufs: &mut Vec<Vec<u8>>, fd: RawFd) {
+    let idx = fd as usize;
+    if idx < conns.len() {
+        if let Some(mut conn) = conns[idx].take() {
+            if free_bufs.len() < MAX_FREE_BUFS {
+                if conn.read.buf.len() > SHRINK_THRESHOLD {
+                    conn.read.buf.truncate(INITIAL_CONN_READ_CAP);
+                    conn.read.buf.shrink_to(INITIAL_CONN_READ_CAP);
+                }
+                free_bufs.push(conn.read.buf);
             }
-        };
-
-        bufs.read_pos = next_pos;
-        bufs.reset_if_empty();
-
-        if res.is_err() || !keep_alive || force_close {
-            break;
         }
+    }
+    unsafe {
+        libc::close(fd);
+    }
+}
+
+#[inline]
+fn recv_nonblock(fd: RawFd, buf: &mut [u8]) -> RecvOut {
+    loop {
+        let n = unsafe {
+            libc::recv(
+                fd,
+                buf.as_mut_ptr() as *mut libc::c_void,
+                buf.len(),
+                libc::MSG_DONTWAIT,
+            )
+        };
+        if n > 0 {
+            return RecvOut::Bytes(n as usize);
+        }
+        if n == 0 {
+            return RecvOut::Eof;
+        }
+        let err = io::Error::last_os_error().raw_os_error().unwrap_or(0);
+        if err == libc::EINTR {
+            continue;
+        }
+        if err == libc::EAGAIN || err == libc::EWOULDBLOCK {
+            return RecvOut::WouldBlock;
+        }
+        return RecvOut::Err;
+    }
+}
+
+#[inline]
+fn send_slice_all(fd: RawFd, slice: &[u8]) -> SendOut {
+    let mut sent = 0usize;
+    while sent < slice.len() {
+        let n = unsafe {
+            libc::send(
+                fd,
+                slice.as_ptr().add(sent) as *const libc::c_void,
+                slice.len() - sent,
+                libc::MSG_NOSIGNAL | libc::MSG_DONTWAIT,
+            )
+        };
+        if n > 0 {
+            sent += n as usize;
+        } else if n == 0 {
+            return SendOut::Partial(sent);
+        } else {
+            let err = io::Error::last_os_error().raw_os_error().unwrap_or(0);
+            if err == libc::EINTR {
+                continue;
+            }
+            if err == libc::EAGAIN || err == libc::EWOULDBLOCK {
+                return SendOut::Partial(sent);
+            }
+            return SendOut::Err;
+        }
+    }
+    SendOut::Done
+}
+
+#[inline]
+fn send_response_now(
+    conn: &mut Conn,
+    write_buf: &Vec<u8>,
+    resp: HttpResponse,
+    close_after: bool,
+) -> FlushRes {
+    let slice: &[u8] = match &resp {
+        HttpResponse::Static(s) => s,
+        HttpResponse::Shared(arc) => arc.as_ref(),
+        HttpResponse::Owned => write_buf.as_slice(),
+    };
+    match send_slice_all(conn.fd, slice) {
+        SendOut::Done => FlushRes::Done,
+        SendOut::Partial(off) => {
+            conn.write_pending = Some(match resp {
+                HttpResponse::Static(s) => PendingWrite::Static { data: s, pos: off },
+                HttpResponse::Shared(arc) => PendingWrite::Shared {
+                    data: arc,
+                    pos: off,
+                },
+                HttpResponse::Owned => PendingWrite::Owned {
+                    data: write_buf[off..].to_vec(),
+                    pos: 0,
+                },
+            });
+            conn.write_is_100 = false;
+            conn.close_after_write = close_after;
+            FlushRes::Pending
+        }
+        SendOut::Err => FlushRes::Err,
+    }
+}
+
+#[inline]
+fn dispatch_request(
+    buf: &[u8],
+    req: &ParsedRequest,
+    write_buf: &mut Vec<u8>,
+    store: &Store,
+) -> HttpResponse {
+    let method = req.method.slice(buf);
+    let path = req.path.slice(buf);
+    let query = req.query.slice(buf);
+    let auth = req.authorization.map(|s| s.slice(buf));
+    let host = req.host.map(|s| s.slice(buf));
+    let git_proto = req.git_protocol.map(|s| s.slice(buf));
+    let body = req.body(buf);
+
+    if method == b"GET" && path == b"/healthz" {
+        HttpResponse::Static(HEALTHZ_RESP)
+    } else if path.starts_with(b"/api/v3") {
+        rest::handle_rest(write_buf, store, method, path, query, auth, host, body)
+    } else if path == b"/api/graphql" {
+        graphql::handle_graphql(write_buf, store, auth, body)
+    } else if path == b"/mcp" {
+        mcp::handle_mcp(write_buf, store, method, auth, body)
+    } else if path.contains(&b'.') && path.windows(5).any(|w| w == b".git/") {
+        git::handle_git(write_buf, store, method, path, query, auth, git_proto, body)
+    } else {
+        HttpResponse::Static(NOT_FOUND_RESP)
+    }
+}
+
+fn run_parse_loop(conn: &mut Conn, write_buf: &mut Vec<u8>, store: &Store) -> ParseLoopOut {
+    let mut handled_any = false;
+    loop {
+        match try_parse_request(&mut conn.read) {
+            ParseResult::Complete(req) => {
+                handled_any = true;
+                let keep_alive = req.keep_alive;
+                let next_pos = req.next_pos;
+                let resp = dispatch_request(&conn.read.buf, &req, write_buf, store);
+                conn.read.advance(next_pos);
+                match send_response_now(conn, write_buf, resp, !keep_alive) {
+                    FlushRes::Done => {
+                        if !keep_alive {
+                            return ParseLoopOut::Close;
+                        }
+                        if conn.read.pos >= conn.read.len {
+                            return ParseLoopOut::NeedMore { handled_any: true };
+                        }
+                    }
+                    FlushRes::Pending => return ParseLoopOut::WaitWritable,
+                    FlushRes::Err => return ParseLoopOut::Close,
+                }
+            }
+            ParseResult::Send100Continue => match send_slice_all(conn.fd, CONTINUE_100_RESP) {
+                SendOut::Done => return ParseLoopOut::Sent100Now,
+                SendOut::Partial(off) => {
+                    conn.write_pending = Some(PendingWrite::Static {
+                        data: CONTINUE_100_RESP,
+                        pos: off,
+                    });
+                    conn.write_is_100 = true;
+                    conn.close_after_write = false;
+                    return ParseLoopOut::WaitWritable;
+                }
+                SendOut::Err => return ParseLoopOut::Close,
+            },
+            ParseResult::NeedMore => return ParseLoopOut::NeedMore { handled_any },
+            ParseResult::Error => return ParseLoopOut::Close,
+        }
+    }
+}
+
+fn on_readable(conn: &mut Conn, write_buf: &mut Vec<u8>, store: &Store) -> ConnAction {
+    'io: loop {
+        if !conn.read.ensure_space() {
+            return ConnAction::Close;
+        }
+        match recv_nonblock(conn.fd, &mut conn.read.buf[conn.read.len..]) {
+            RecvOut::Bytes(k) => {
+                conn.read.len += k;
+            }
+            RecvOut::Eof => {
+                conn.peer_eof = true;
+            }
+            RecvOut::WouldBlock => {
+                if conn.peer_eof && conn.read.pos >= conn.read.len {
+                    return ConnAction::Close;
+                }
+                return ConnAction::Keep;
+            }
+            RecvOut::Err => return ConnAction::Close,
+        }
+
+        match run_parse_loop(conn, write_buf, store) {
+            ParseLoopOut::NeedMore { handled_any } => {
+                if conn.peer_eof {
+                    return ConnAction::Close;
+                }
+                if handled_any && conn.read.pos >= conn.read.len {
+                    return ConnAction::Keep;
+                }
+                continue 'io;
+            }
+            ParseLoopOut::Sent100Now => {
+                if conn.peer_eof {
+                    return ConnAction::Close;
+                }
+                continue 'io;
+            }
+            ParseLoopOut::WaitWritable => return ConnAction::WantWrite,
+            ParseLoopOut::Close => return ConnAction::Close,
+        }
+    }
+}
+
+fn on_writable(conn: &mut Conn, write_buf: &mut Vec<u8>, store: &Store) -> ConnAction {
+    let Some(ref mut pw) = conn.write_pending else {
+        return ConnAction::WantRead;
+    };
+    match send_slice_all(conn.fd, pw.slice()) {
+        SendOut::Done => {
+            conn.write_pending = None;
+            let was_100 = conn.write_is_100;
+            conn.write_is_100 = false;
+            if conn.close_after_write {
+                return ConnAction::Close;
+            }
+            if was_100 {
+                return ConnAction::WantRead;
+            }
+            if conn.read.pos < conn.read.len {
+                match run_parse_loop(conn, write_buf, store) {
+                    ParseLoopOut::NeedMore { .. } | ParseLoopOut::Sent100Now => {
+                        if conn.peer_eof {
+                            return ConnAction::Close;
+                        }
+                        ConnAction::WantRead
+                    }
+                    ParseLoopOut::WaitWritable => ConnAction::StillWrite,
+                    ParseLoopOut::Close => ConnAction::Close,
+                }
+            } else {
+                ConnAction::WantRead
+            }
+        }
+        SendOut::Partial(n) => {
+            pw.advance(n);
+            ConnAction::StillWrite
+        }
+        SendOut::Err => ConnAction::Close,
     }
 }
 

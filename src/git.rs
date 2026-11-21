@@ -1,7 +1,6 @@
 use std::cell::RefCell;
 use std::collections::VecDeque;
-use std::io::{self, Write};
-use std::net::TcpStream;
+use std::io::Write;
 use std::sync::Arc;
 
 use flate2::write::ZlibEncoder;
@@ -10,8 +9,8 @@ use rustc_hash::FxHashMap;
 use sha1::{Digest, Sha1};
 
 use crate::http::{
-    build_preframed_http, write_json_message, write_preframed, write_preframed_opt_close,
-    write_raw_resp, NOT_FOUND_RESP, UNAUTH_RESP,
+    build_preframed_http, write_json_message, write_raw_resp, HttpResponse, NOT_FOUND_RESP,
+    UNAUTH_RESP,
 };
 use crate::store::{parse_tag_target, parse_tree, ObjType, ReceiveRefsCache, Repo, Store};
 use crate::util::{
@@ -19,7 +18,9 @@ use crate::util::{
     write_pkt_line, Oid, OidMap, OidSet, ZERO_OID,
 };
 
-const GIT_V2_INFO_REFS_RESP: &[u8] = b"HTTP/1.1 200 OK\r\nContent-Type: application/x-git-upload-pack-advertisement\r\nX-GitHub-Request-Id: 1\r\nContent-Length: 78\r\n\r\n000eversion 2\n0013ls-refs=unborn\n0012fetch=shallow\n0017object-format=sha1\n0000";
+const GIT_V2_INFO_REFS_BODY: &[u8] = b"000eversion 2\n0013ls-refs=unborn\n0012fetch=shallow\n0000";
+const _: () = assert!(GIT_V2_INFO_REFS_BODY.len() == 55);
+const GIT_V2_INFO_REFS_RESP: &[u8] = b"HTTP/1.1 200 OK\r\nContent-Type: application/x-git-upload-pack-advertisement\r\nX-GitHub-Request-Id: 1\r\nContent-Length: 55\r\n\r\n000eversion 2\n0013ls-refs=unborn\n0012fetch=shallow\n0000";
 
 const PKT_MAX_SIDEBAND_PAYLOAD: usize = 65515;
 
@@ -36,7 +37,6 @@ thread_local! {
 }
 
 pub fn handle_git(
-    stream: &mut TcpStream,
     write_buf: &mut Vec<u8>,
     store: &Store,
     method: &[u8],
@@ -45,54 +45,56 @@ pub fn handle_git(
     auth: Option<&[u8]>,
     git_protocol: Option<&[u8]>,
     body: &[u8],
-    force_close: bool,
-) -> io::Result<()> {
+) -> HttpResponse {
     if !store.check_auth(auth) {
-        return write_preframed(stream, UNAUTH_RESP);
+        return HttpResponse::Static(UNAUTH_RESP);
     }
 
     let path_str = std::str::from_utf8(path).unwrap_or("");
     let trimmed = path_str.strip_prefix('/').unwrap_or(path_str);
     let Some(slash1) = trimmed.find('/') else {
-        return write_preframed(stream, NOT_FOUND_RESP);
+        return HttpResponse::Static(NOT_FOUND_RESP);
     };
     let owner = percent_decode_path(trimmed[..slash1].as_bytes());
     let rest1 = &trimmed[slash1 + 1..];
     let Some(dot_git_pos) = rest1.find(".git/") else {
-        return write_preframed(stream, NOT_FOUND_RESP);
+        return HttpResponse::Static(NOT_FOUND_RESP);
     };
     let repo_name = percent_decode_path(rest1[..dot_git_pos].as_bytes());
     let endpoint = &rest1[dot_git_pos + 4..];
 
-    let Some((_owner_login, repo_arc)) = store.get_repo(&owner, &repo_name) else {
-        return write_preframed(stream, NOT_FOUND_RESP);
+    let Some(repo_arc) = store.get_repo_arc(&owner, &repo_name) else {
+        return HttpResponse::Static(NOT_FOUND_RESP);
     };
 
     match (method, endpoint) {
         (b"GET", "/info/refs") => {
-            let service = parse_query_param(query, b"service");
-            match service.as_deref() {
+            let service_alloc;
+            let service: Option<&str> = if query == b"service=git-upload-pack" {
+                Some("git-upload-pack")
+            } else if query == b"service=git-receive-pack" {
+                Some("git-receive-pack")
+            } else {
+                service_alloc = parse_query_param(query, b"service");
+                service_alloc.as_deref()
+            };
+            match service {
                 Some("git-upload-pack") => {
                     let is_v2 = git_protocol
                         .map(|gp| gp.windows(9).any(|w| w == b"version=2"))
                         .unwrap_or(false);
                     if is_v2 {
-                        return write_preframed_opt_close(
-                            stream,
-                            write_buf,
-                            GIT_V2_INFO_REFS_RESP,
-                            force_close,
-                        );
+                        return HttpResponse::Static(GIT_V2_INFO_REFS_RESP);
                     }
-                    let repo = repo_arc.read().unwrap();
-                    let pkt = build_v0_upload_refs(&repo);
-                    let extra: &[u8] = if force_close { b"Connection: close\r\n" } else { b"" };
+                    let pkt = {
+                        let repo = repo_arc.read().unwrap();
+                        build_v0_upload_refs(&repo)
+                    };
                     write_raw_resp(
-                        stream,
                         write_buf,
                         200,
                         b"application/x-git-upload-pack-advertisement",
-                        extra,
+                        b"",
                         &pkt,
                     )
                 }
@@ -100,19 +102,24 @@ pub fn handle_git(
                     {
                         let repo = repo_arc.read().unwrap();
                         if let Some(ref cached) = repo.cache_receive_refs {
-                            return write_preframed(stream, &cached.bytes);
+                            write_buf.clear();
+                            write_buf.extend_from_slice(&cached.bytes);
+                            return HttpResponse::Owned;
                         }
                     }
                     let mut repo = repo_arc.write().unwrap();
                     if let Some(ref cached) = repo.cache_receive_refs {
-                        return write_preframed(stream, &cached.bytes);
+                        write_buf.clear();
+                        write_buf.extend_from_slice(&cached.bytes);
+                        return HttpResponse::Owned;
                     }
                     let cached = build_receive_refs_cache(&repo);
-                    let resp = cached.bytes.clone();
+                    write_buf.clear();
+                    write_buf.extend_from_slice(&cached.bytes);
                     repo.cache_receive_refs = Some(cached);
-                    write_preframed(stream, &resp)
+                    HttpResponse::Owned
                 }
-                _ => write_preframed(stream, NOT_FOUND_RESP),
+                _ => HttpResponse::Static(NOT_FOUND_RESP),
             }
         }
         (b"POST", "/git-upload-pack") => {
@@ -120,15 +127,13 @@ pub fn handle_git(
                 .map(|gp| gp.windows(9).any(|w| w == b"version=2"))
                 .unwrap_or(false);
             if is_v2 {
-                handle_upload_pack_v2(stream, write_buf, &repo_arc, body, force_close)
+                handle_upload_pack_v2(write_buf, &repo_arc, body)
             } else {
-                handle_upload_pack_v0(stream, write_buf, &repo_arc, body, force_close)
+                handle_upload_pack_v0(write_buf, &repo_arc, body)
             }
         }
-        (b"POST", "/git-receive-pack") => {
-            handle_receive_pack(stream, write_buf, &repo_arc, body)
-        }
-        _ => write_preframed(stream, NOT_FOUND_RESP),
+        (b"POST", "/git-receive-pack") => handle_receive_pack(write_buf, &repo_arc, body),
+        _ => HttpResponse::Static(NOT_FOUND_RESP),
     }
 }
 
@@ -281,166 +286,175 @@ fn parse_pkt_stream(mut data: &[u8]) -> Result<Vec<Pkt<'_>>, ()> {
 }
 
 fn handle_upload_pack_v2(
-    stream: &mut TcpStream,
     write_buf: &mut Vec<u8>,
     repo_arc: &std::sync::RwLock<Repo>,
-    body: &[u8],
-    force_close: bool,
-) -> io::Result<()> {
-    let Ok(pkts) = parse_pkt_stream(body) else {
-        return write_json_message(stream, write_buf, 400, "Invalid pkt-line");
-    };
-    let mut command = "";
+    mut data: &[u8],
+) -> HttpResponse {
+    let mut command: &[u8] = b"";
     let mut in_args = false;
-    let mut args: Vec<&[u8]> = Vec::new();
-    for p in &pkts {
-        match p {
-            Pkt::Delim => in_args = true,
-            Pkt::Flush => break,
-            Pkt::ResponseEnd => {}
-            Pkt::Data(d) => {
-                let d = d.strip_suffix(b"\n").unwrap_or(d);
-                if !in_args {
-                    if let Some(cmd) = d.strip_prefix(b"command=") {
-                        command = std::str::from_utf8(cmd).unwrap_or("");
-                    }
-                } else {
-                    args.push(d);
+
+    let mut peel = false;
+    let mut symrefs = false;
+    let mut unborn = false;
+    let mut prefixes: Vec<&str> = Vec::new();
+
+    let mut first_want: Option<Oid> = None;
+    let mut extra_wants: Vec<Oid> = Vec::new();
+    let mut haves: Vec<Oid> = Vec::new();
+    let mut client_shallow: Vec<Oid> = Vec::new();
+    let mut depth: Option<usize> = None;
+    let mut done = false;
+
+    while !data.is_empty() {
+        if data.len() < 4 {
+            return write_json_message(write_buf, 400, "Invalid pkt-line");
+        }
+        let Ok(hex_str) = std::str::from_utf8(&data[..4]) else {
+            return write_json_message(write_buf, 400, "Invalid pkt-line");
+        };
+        let Ok(len) = usize::from_str_radix(hex_str, 16) else {
+            return write_json_message(write_buf, 400, "Invalid pkt-line");
+        };
+        if len == 0 {
+            break;
+        } else if len == 1 {
+            in_args = true;
+            data = &data[4..];
+            continue;
+        } else if len == 2 {
+            data = &data[4..];
+            continue;
+        } else if len < 4 || len > data.len() {
+            return write_json_message(write_buf, 400, "Invalid pkt-line");
+        }
+        let d = &data[4..len];
+        data = &data[len..];
+        let d = d.strip_suffix(b"\n").unwrap_or(d);
+        if !in_args {
+            if let Some(cmd) = d.strip_prefix(b"command=") {
+                command = cmd;
+            }
+        } else if command == b"ls-refs" {
+            if d == b"peel" {
+                peel = true;
+            } else if d == b"symrefs" {
+                symrefs = true;
+            } else if d == b"unborn" {
+                unborn = true;
+            } else if let Some(p) = d.strip_prefix(b"ref-prefix ") {
+                if let Ok(s) = std::str::from_utf8(p) {
+                    prefixes.push(s);
                 }
+            }
+        } else if command == b"fetch" {
+            if let Some(h) = d.strip_prefix(b"want ") {
+                if let Some(oid) = hex_to_oid(h) {
+                    if first_want.is_none() {
+                        first_want = Some(oid);
+                    } else {
+                        extra_wants.push(oid);
+                    }
+                }
+            } else if let Some(h) = d.strip_prefix(b"have ") {
+                if let Some(oid) = hex_to_oid(h) {
+                    haves.push(oid);
+                }
+            } else if let Some(h) = d.strip_prefix(b"shallow ") {
+                if let Some(oid) = hex_to_oid(h) {
+                    client_shallow.push(oid);
+                }
+            } else if let Some(dp) = d.strip_prefix(b"deepen ") {
+                if let Ok(s) = std::str::from_utf8(dp) {
+                    depth = s.parse::<usize>().ok();
+                }
+            } else if d == b"done" {
+                done = true;
             }
         }
     }
 
     match command {
-        "ls-refs" => {
-            let mut peel = false;
-            let mut symrefs = false;
-            let mut unborn = false;
-            let mut prefixes: Vec<&str> = Vec::new();
-            for a in args {
-                if a == b"peel" {
-                    peel = true;
-                } else if a == b"symrefs" {
-                    symrefs = true;
-                } else if a == b"unborn" {
-                    unborn = true;
-                } else if let Some(p) = a.strip_prefix(b"ref-prefix ") {
-                    if let Ok(s) = std::str::from_utf8(p) {
-                        prefixes.push(s);
-                    }
-                }
-            }
-
+        b"ls-refs" => {
             if prefixes.is_empty() && peel && symrefs {
                 {
                     let repo = repo_arc.read().unwrap();
                     if let Some(ref cached) = repo.cache_ls_refs_full {
-                        return write_preframed_opt_close(
-                            stream,
-                            write_buf,
-                            cached,
-                            force_close,
-                        );
+                        return HttpResponse::Shared(Arc::clone(cached));
                     }
                 }
                 let mut repo = repo_arc.write().unwrap();
                 if let Some(ref cached) = repo.cache_ls_refs_full {
-                    return write_preframed_opt_close(stream, write_buf, cached, force_close);
+                    return HttpResponse::Shared(Arc::clone(cached));
                 }
-                let body = build_ls_refs_body(&repo, true, true, true, &[]);
-                let frame = build_preframed_http(200, b"application/x-git-upload-pack-result", &body);
+                let resp_body = build_ls_refs_body(&repo, true, true, true, &[]);
+                let frame =
+                    build_preframed_http(200, b"application/x-git-upload-pack-result", &resp_body);
                 repo.cache_ls_refs_full = Some(Arc::clone(&frame));
-                return write_preframed_opt_close(stream, write_buf, &frame, force_close);
+                return HttpResponse::Shared(frame);
             }
 
-            let repo = repo_arc.read().unwrap();
-            let resp = build_ls_refs_body(&repo, peel, symrefs, unborn, &prefixes);
-            let extra: &[u8] = if force_close { b"Connection: close\r\n" } else { b"" };
+            let resp = {
+                let repo = repo_arc.read().unwrap();
+                build_ls_refs_body(&repo, peel, symrefs, unborn, &prefixes)
+            };
             write_raw_resp(
-                stream,
                 write_buf,
                 200,
                 b"application/x-git-upload-pack-result",
-                extra,
+                b"",
                 &resp,
             )
         }
-        "fetch" => {
-            let mut wants: Vec<Oid> = Vec::new();
-            let mut haves: Vec<Oid> = Vec::new();
-            let mut client_shallow: Vec<Oid> = Vec::new();
-            let mut depth: Option<usize> = None;
-            let mut done = false;
-
-            for a in args {
-                if let Some(h) = a.strip_prefix(b"want ") {
-                    if let Some(oid) = hex_to_oid(h) {
-                        wants.push(oid);
-                    }
-                } else if let Some(h) = a.strip_prefix(b"have ") {
-                    if let Some(oid) = hex_to_oid(h) {
-                        haves.push(oid);
-                    }
-                } else if let Some(h) = a.strip_prefix(b"shallow ") {
-                    if let Some(oid) = hex_to_oid(h) {
-                        client_shallow.push(oid);
-                    }
-                } else if let Some(d) = a.strip_prefix(b"deepen ") {
-                    if let Ok(s) = std::str::from_utf8(d) {
-                        depth = s.parse::<usize>().ok();
-                    }
-                } else if a == b"done" {
-                    done = true;
-                }
-            }
-
+        b"fetch" => {
             // Fast path: depth=1 single want clone with no haves/shallow
-            if wants.len() == 1
-                && haves.is_empty()
-                && client_shallow.is_empty()
-                && depth == Some(1)
-                && done
-            {
-                let tip = wants[0];
+            if let Some(tip) = first_want {
+                if extra_wants.is_empty()
+                    && haves.is_empty()
+                    && client_shallow.is_empty()
+                    && depth == Some(1)
+                    && done
                 {
-                    let repo = repo_arc.read().unwrap();
-                    if let Some((cached_tip, ref frame)) = repo.cache_fetch_depth1 {
-                        if cached_tip == tip {
-                            return write_preframed_opt_close(
-                                stream,
-                                write_buf,
-                                frame,
-                                force_close,
-                            );
+                    {
+                        let repo = repo_arc.read().unwrap();
+                        if let Some((cached_tip, ref frame)) = repo.cache_fetch_depth1 {
+                            if cached_tip == tip {
+                                return HttpResponse::Shared(Arc::clone(frame));
+                            }
                         }
                     }
-                }
-                let mut repo = repo_arc.write().unwrap();
-                if let Some((cached_tip, ref frame)) = repo.cache_fetch_depth1 {
-                    if cached_tip == tip {
-                        return write_preframed_opt_close(stream, write_buf, frame, force_close);
+                    let mut repo = repo_arc.write().unwrap();
+                    if let Some((cached_tip, ref frame)) = repo.cache_fetch_depth1 {
+                        if cached_tip == tip {
+                            return HttpResponse::Shared(Arc::clone(frame));
+                        }
                     }
-                }
-                if repo.objects.contains_key(&tip) {
-                    let frame = build_depth1_cached_fetch(&repo, tip);
-                    repo.cache_fetch_depth1 = Some((tip, Arc::clone(&frame)));
-                    return write_preframed_opt_close(stream, write_buf, &frame, force_close);
+                    if repo.objects.contains_key(&tip) {
+                        let frame = build_depth1_cached_fetch(&repo, tip);
+                        repo.cache_fetch_depth1 = Some((tip, Arc::clone(&frame)));
+                        return HttpResponse::Shared(frame);
+                    }
                 }
             }
 
-            let repo = repo_arc.read().unwrap();
-            let resp = build_v2_fetch_body(&repo, &wants, &haves, &client_shallow, depth, done);
-            let extra: &[u8] = if force_close { b"Connection: close\r\n" } else { b"" };
+            let mut wants =
+                Vec::with_capacity(if first_want.is_some() { 1 + extra_wants.len() } else { 0 });
+            if let Some(w0) = first_want {
+                wants.push(w0);
+                wants.extend_from_slice(&extra_wants);
+            }
+            let resp = {
+                let repo = repo_arc.read().unwrap();
+                build_v2_fetch_body(&repo, &wants, &haves, &client_shallow, depth, done)
+            };
             write_raw_resp(
-                stream,
                 write_buf,
                 200,
                 b"application/x-git-upload-pack-result",
-                extra,
+                b"",
                 &resp,
             )
         }
-        _ => write_json_message(stream, write_buf, 400, "Unknown git command"),
+        _ => write_json_message(write_buf, 400, "Unknown git command"),
     }
 }
 
@@ -586,14 +600,12 @@ fn build_v2_fetch_body(
 }
 
 fn handle_upload_pack_v0(
-    stream: &mut TcpStream,
     write_buf: &mut Vec<u8>,
     repo_arc: &std::sync::RwLock<Repo>,
     body: &[u8],
-    force_close: bool,
-) -> io::Result<()> {
+) -> HttpResponse {
     let Ok(pkts) = parse_pkt_stream(body) else {
-        return write_json_message(stream, write_buf, 400, "Invalid pkt-line");
+        return write_json_message(write_buf, 400, "Invalid pkt-line");
     };
     let mut wants = Vec::new();
     let mut haves = Vec::new();
@@ -632,39 +644,40 @@ fn handle_upload_pack_v0(
         }
     }
 
-    let repo = repo_arc.read().unwrap();
-    let (to_send, new_shallow, unshallow) =
-        compute_fetch_objects(&repo, &wants, &haves, &client_shallow, depth);
-    let mut out = Vec::new();
-    if !new_shallow.is_empty() || !unshallow.is_empty() {
-        for oid in &new_shallow {
-            let mut line = Vec::with_capacity(50);
-            line.extend_from_slice(b"shallow ");
-            write_oid_hex(oid, &mut line);
-            line.push(b'\n');
-            write_pkt_line(&mut out, &line);
+    let out = {
+        let repo = repo_arc.read().unwrap();
+        let (to_send, new_shallow, unshallow) =
+            compute_fetch_objects(&repo, &wants, &haves, &client_shallow, depth);
+        let mut out = Vec::new();
+        if !new_shallow.is_empty() || !unshallow.is_empty() {
+            for oid in &new_shallow {
+                let mut line = Vec::with_capacity(50);
+                line.extend_from_slice(b"shallow ");
+                write_oid_hex(oid, &mut line);
+                line.push(b'\n');
+                write_pkt_line(&mut out, &line);
+            }
+            for oid in &unshallow {
+                let mut line = Vec::with_capacity(52);
+                line.extend_from_slice(b"unshallow ");
+                write_oid_hex(oid, &mut line);
+                line.push(b'\n');
+                write_pkt_line(&mut out, &line);
+            }
+            out.extend_from_slice(b"0000");
         }
-        for oid in &unshallow {
-            let mut line = Vec::with_capacity(52);
-            line.extend_from_slice(b"unshallow ");
-            write_oid_hex(oid, &mut line);
-            line.push(b'\n');
-            write_pkt_line(&mut out, &line);
-        }
+        write_pkt_line(&mut out, b"NAK\n");
+        let pack = build_pack(&repo, &to_send, Compression::fast());
+        write_sideband_pack(&mut out, &pack);
         out.extend_from_slice(b"0000");
-    }
-    write_pkt_line(&mut out, b"NAK\n");
-    let pack = build_pack(&repo, &to_send, Compression::fast());
-    write_sideband_pack(&mut out, &pack);
-    out.extend_from_slice(b"0000");
+        out
+    };
 
-    let extra: &[u8] = if force_close { b"Connection: close\r\n" } else { b"" };
     write_raw_resp(
-        stream,
         write_buf,
         200,
         b"application/x-git-upload-pack-result",
-        extra,
+        b"",
         &out,
     )
 }
@@ -880,31 +893,30 @@ struct PushCmd<'a> {
 }
 
 fn handle_receive_pack(
-    stream: &mut TcpStream,
     write_buf: &mut Vec<u8>,
     repo_arc: &std::sync::RwLock<Repo>,
     mut body: &[u8],
-) -> io::Result<()> {
+) -> HttpResponse {
     let mut cmds: Vec<PushCmd<'_>> = Vec::new();
     let mut sideband = false;
     let mut first = true;
 
     loop {
         if body.len() < 4 {
-            return write_json_message(stream, write_buf, 400, "Invalid pkt-line");
+            return write_json_message(write_buf, 400, "Invalid pkt-line");
         }
         let Ok(hex_str) = std::str::from_utf8(&body[..4]) else {
-            return write_json_message(stream, write_buf, 400, "Invalid pkt-line");
+            return write_json_message(write_buf, 400, "Invalid pkt-line");
         };
         let Ok(len) = usize::from_str_radix(hex_str, 16) else {
-            return write_json_message(stream, write_buf, 400, "Invalid pkt-line");
+            return write_json_message(write_buf, 400, "Invalid pkt-line");
         };
         if len == 0 {
             body = &body[4..];
             break;
         }
         if len < 4 || len > body.len() {
-            return write_json_message(stream, write_buf, 400, "Truncated pkt-line");
+            return write_json_message(write_buf, 400, "Truncated pkt-line");
         }
         let payload = &body[4..len];
         body = &body[len..];
@@ -921,19 +933,19 @@ fn handle_receive_pack(
         }
 
         let Some(old_oid) = cmd_bytes.get(0..40).and_then(hex_to_oid) else {
-            return write_json_message(stream, write_buf, 400, "Bad old oid");
+            return write_json_message(write_buf, 400, "Bad old oid");
         };
         if cmd_bytes.get(40) != Some(&b' ') {
-            return write_json_message(stream, write_buf, 400, "Bad command");
+            return write_json_message(write_buf, 400, "Bad command");
         }
         let Some(new_oid) = cmd_bytes.get(41..81).and_then(hex_to_oid) else {
-            return write_json_message(stream, write_buf, 400, "Bad new oid");
+            return write_json_message(write_buf, 400, "Bad new oid");
         };
         if cmd_bytes.get(81) != Some(&b' ') {
-            return write_json_message(stream, write_buf, 400, "Bad command");
+            return write_json_message(write_buf, 400, "Bad command");
         }
         let Ok(ref_name) = std::str::from_utf8(&cmd_bytes[82..]) else {
-            return write_json_message(stream, write_buf, 400, "Bad ref name");
+            return write_json_message(write_buf, 400, "Bad ref name");
         };
         cmds.push(PushCmd {
             old_oid,
@@ -947,6 +959,7 @@ fn handle_receive_pack(
 
     if !pack_bytes.is_empty() {
         if let Err(err) = unpack_into_repo(&mut repo, pack_bytes) {
+            drop(repo);
             let mut report = Vec::with_capacity(256);
             let msg = format!("unpack {}\n", err);
             write_pkt_line(&mut report, msg.as_bytes());
@@ -955,7 +968,7 @@ fn handle_receive_pack(
                 write_pkt_line(&mut report, line.as_bytes());
             }
             report.extend_from_slice(b"0000");
-            return send_push_report(stream, write_buf, sideband, &report);
+            return send_push_report(write_buf, sideband, &report);
         }
     }
 
@@ -1034,18 +1047,18 @@ fn handle_receive_pack(
             repo.cache_receive_refs = None;
         }
     }
+    drop(repo);
 
     report.extend_from_slice(b"0000");
-    send_push_report(stream, write_buf, sideband, &report)
+    send_push_report(write_buf, sideband, &report)
 }
 
 #[inline]
 fn send_push_report(
-    stream: &mut TcpStream,
     write_buf: &mut Vec<u8>,
     sideband: bool,
     report: &[u8],
-) -> io::Result<()> {
+) -> HttpResponse {
     if sideband {
         let mut framed = Vec::with_capacity(report.len() + 12);
         write_pkt_len(&mut framed, 4 + 1 + report.len());
@@ -1053,7 +1066,6 @@ fn send_push_report(
         framed.extend_from_slice(report);
         framed.extend_from_slice(b"0000");
         write_raw_resp(
-            stream,
             write_buf,
             200,
             b"application/x-git-receive-pack-result",
@@ -1062,7 +1074,6 @@ fn send_push_report(
         )
     } else {
         write_raw_resp(
-            stream,
             write_buf,
             200,
             b"application/x-git-receive-pack-result",

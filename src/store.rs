@@ -748,6 +748,15 @@ impl Store {
         }
     }
 
+    #[inline]
+    pub fn get_repo_arc(&self, owner: &str, name: &str) -> Option<Arc<RwLock<Repo>>> {
+        let g = self.inner.read().unwrap();
+        if owner != g.owner_login {
+            return None;
+        }
+        g.repos.get(name).cloned()
+    }
+
     pub fn get_repo(&self, owner: &str, name: &str) -> Option<(String, Arc<RwLock<Repo>>)> {
         let g = self.inner.read().unwrap();
         if owner != g.owner_login {

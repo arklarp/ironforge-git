@@ -167,7 +167,10 @@ pub fn b64_decode(input: &[u8]) -> Option<Vec<u8>> {
     Some(out)
 }
 
-pub fn percent_decode_path(input: &[u8]) -> String {
+pub fn percent_decode_path(input: &[u8]) -> Cow<'_, str> {
+    if !input.contains(&b'%') {
+        return String::from_utf8_lossy(input);
+    }
     let mut out = Vec::with_capacity(input.len());
     let mut i = 0;
     while i < input.len() {
@@ -181,7 +184,7 @@ pub fn percent_decode_path(input: &[u8]) -> String {
         out.push(input[i]);
         i += 1;
     }
-    String::from_utf8_lossy(&out).into_owned()
+    Cow::Owned(String::from_utf8_lossy(&out).into_owned())
 }
 
 pub fn percent_decode_query(input: &[u8]) -> String {
